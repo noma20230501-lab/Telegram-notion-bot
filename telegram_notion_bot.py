@@ -1138,6 +1138,10 @@ class TelegramNotionBot:
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ):
         """채널 메시지 수정 감지 및 노션 자동 업데이트"""
+        # 수정된 메시지가 아니면 무시 (group=1에서 모든 업데이트를 받으므로)
+        if not (update.edited_channel_post or update.edited_message):
+            return
+        
         message = update.effective_message
         if not message:
             return
@@ -1687,12 +1691,15 @@ class TelegramNotionBot:
         )
 
         # 채널/그룹 메시지 수정 감지
+        # 별도 그룹(group=1)에 등록하여 기존 핸들러와 독립적으로 동작
+        # UpdateFilter만 사용하면 MessageHandler 내부 2차 필터링에서 실패하므로
+        # filters.ALL을 사용하고 콜백에서 수정 여부를 직접 확인
         application.add_handler(
             MessageHandler(
-                filters.UpdateType.EDITED_CHANNEL_POST
-                | filters.UpdateType.EDITED_MESSAGE,
+                filters.ALL,
                 self.handle_edited_message,
-            )
+            ),
+            group=1,
         )
 
         # 사진 메시지 (그룹 + 채널)
