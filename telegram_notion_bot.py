@@ -1154,17 +1154,35 @@ class TelegramNotionBot:
             logger.debug(f"봇 수정 무시: msg_id={msg_id}")
             return
         
-        # 매핑된 페이지가 없으면 무시 (노션에 등록된 매물이 아님)
+        current_text = message.text or message.caption or ""
+        
+        # 매핑된 페이지가 없으면 메시지 텍스트에서 복구 시도
         if msg_id not in self._page_mapping:
-            return
+            # 구분선 + 노션 URL이 있는 메시지만 처리 (이미 등록된 매물)
+            if self.DIVIDER in current_text and "notion.so" in current_text:
+                match = re.search(r'([a-f0-9]{32})', current_text)
+                if match:
+                    raw_id = match.group(1)
+                    page_id = (
+                        f"{raw_id[:8]}-{raw_id[8:12]}"
+                        f"-{raw_id[12:16]}"
+                        f"-{raw_id[16:20]}-{raw_id[20:]}"
+                    )
+                    self._page_mapping[msg_id] = page_id
+                    logger.info(
+                        f"매핑 복구: msg_id={msg_id} → {page_id}"
+                    )
+                else:
+                    return
+            else:
+                return
         
         page_id = self._page_mapping[msg_id]
-        current_text = message.text or message.caption or ""
         
         # 구분선으로 매물 정보만 추출
         property_text = self._extract_property_text(current_text)
         
-        # 이전 매물 텍스트와 비교
+        # 이전 매물 텍스트와 비교 (매핑 복구 시 이전 텍스트 없으면 무조건 업데이트)
         old_property_text = self._original_texts.get(msg_id, "")
         
         # 변경 없으면 무시 (봇이 추가한 수정 이력만 변경된 경우)
