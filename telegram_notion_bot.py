@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 텔레그램 부동산 매물 -> 노션 자동 등록 봇
-(여러 장 사진 앨범 지원 + 답장으로 매물 수정)
+(여러 장 사진 앨범 지원 + 원본 수정 시 노션 자동 반영)
 """
 
 import os
@@ -936,7 +936,7 @@ class NotionUploader:
 
 
 class TelegramNotionBot:
-    """텔레그램-노션 연동 봇 (앨범/여러 장 사진 + 답장 수정 지원)"""
+    """텔레그램-노션 연동 봇 (앨범/여러 장 사진 + 원본 수정 자동 반영)"""
 
     # 앨범 사진 수집 대기 시간 (초)
     MEDIA_GROUP_TIMEOUT = 2.0
@@ -960,13 +960,15 @@ class TelegramNotionBot:
         "📌 *사용법:*\n"
         "• 사진 여러 장 \\+ 캡션 → 모든 사진 등록\n"
         "• 텍스트만 보내기 → 사진 없이 등록\n"
-        "• ✅ 등록 메시지에 *답장* → 매물 정보 수정\n\n"
+        "• 원본 메시지 수정 → 노션에 자동 반영 ✨\n\n"
         "📌 *수정 방법:*\n"
-        "봇의 ✅ 등록 메시지에 답장으로 수정할 항목만 보내세요\n"
-        "예: `1\\.3000/150 부별` → 보증금/월세/부가세만 수정\n\n"
+        "등록된 매물의 *원본 메시지를 직접 수정*하면\n"
+        "노션에도 자동으로 반영됩니다\\!\n"
+        "예: `1\\.3000/150 부별` → 보증금/월세/부가세 수정\n\n"
         "📌 *명령어:*\n"
         "/start \\- 봇 시작\n"
-        "/help \\- 도움말 보기"
+        "/help \\- 도움말 보기\n"
+        "/check \\- 매물 동기화 상태 확인"
     )
 
     def __init__(
@@ -982,10 +984,12 @@ class TelegramNotionBot:
         self._media_groups: Dict[str, Dict] = {}
         # asyncio 타이머 태스크
         self._pending_tasks: Dict[str, asyncio.Task] = {}
-        # 메시지 ID → 노션 페이지 ID 매핑 (원본 + ✅ 메시지 모두)
+        # 메시지 ID → 노션 페이지 ID 매핑
         self._page_mapping: Dict[int, str] = {}
-        # 페이지 ID → ✅ 확인 메시지 정보 (수정 시 ✅ 메시지 찾기용)
-        self._confirm_msg_info: Dict[str, Dict] = {}
+        # 메시지 ID → 원본 매물 텍스트 (변경 감지용)
+        self._original_texts: Dict[int, str] = {}
+        # 무한루프 방지: 봇이 수정 중인 메시지 ID
+        self._bot_editing: set = set()
 
     @staticmethod
     def _is_listing_format(
@@ -1014,15 +1018,81 @@ class TelegramNotionBot:
         return False
 
     # ──────────────────────────────────────────────
-    # ✅ 등록/수정 확인 메시지 생성 헬퍼
+    # ✅ 원본 메시지 수정 헬퍼 (구분선 추가)
     # ──────────────────────────────────────────────
 
+    DIVIDER = "━━━━━━━━━━━━━━"  # 구분선
+
     @staticmethod
-    def _build_confirm_text(
-        property_data: Dict, page_url: str, photo_count: int
+    def _extract_property_text(message_text: str) -> str:
+        """메시지에서 구분선 위쪽(매물 정보)만 추출"""
+        if TelegramNotionBot.DIVIDER in message_text:
+            return message_text.split(TelegramNotionBot.DIVIDER)[0].strip()
+        return message_text.strip()
+
+    @staticmethod
+    def _build_notion_section(
+        page_url: str, page_id: str, update_log: str = ""
     ) -> str:
-        """✅ 등록 확인 메시지 텍스트 생성 (짧은 버전)"""
-        return f"✅ 노션 등록완료\n🔗 {page_url}"
+        """구분선 아래 노션 정보 섹션 생성"""
+        section = (
+            f"\n\n{TelegramNotionBot.DIVIDER}\n"
+            f"✅ 노션 등록완료\n"
+            f"🔗 {page_url}"
+        )
+        if update_log:
+            section += f"\n{update_log}"
+        return section
+
+    @staticmethod
+    def _build_update_summary(
+        old_data: Dict, new_data: Dict
+    ) -> str:
+        """수정 사항을 한 줄로 간략하게 요약
+        예: 월세55→65, 보증금1000→2000
+        """
+        changes = []
+        field_names = {
+            "보증금": "보증금",
+            "월세": "월세",
+            "부가세": "부가세",
+            "관리비": "관리비",
+            "권리금": "권리금",
+            "건축물용도": "용도",
+            "계약면적": "계약㎡",
+            "전용면적": "전용㎡",
+            "주차": "주차",
+            "방향": "방향",
+            "화장실 위치": "화장실위치",
+            "화장실 수": "화장실",
+            "위반건축물": "위반",
+            "대표 연락처": "연락처",
+        }
+        
+        for key, label in field_names.items():
+            if key not in new_data:
+                continue
+            new_val = new_data[key]
+            old_val = old_data.get(key)
+            
+            # 숫자 비교
+            if isinstance(old_val, (int, float)) and isinstance(new_val, (int, float)):
+                if old_val != new_val:
+                    old_disp = int(old_val) if isinstance(old_val, float) and old_val == int(old_val) else old_val
+                    changes.append(f"{label}{old_disp}→{new_val}")
+            elif old_val is not None:
+                if str(old_val) != str(new_val):
+                    changes.append(f"{label}{old_val}→{new_val}")
+            else:
+                # 새로 추가
+                changes.append(f"{label}:{new_val}")
+        
+        # 특이사항 체크
+        if "특이사항" in new_data:
+            if str(old_data.get("특이사항", "")) != str(new_data["특이사항"]):
+                changes.append("특이사항수정")
+        
+        return ", ".join(changes) if changes else "내용수정"
 
     # ──────────────────────────────────────────────
     # 답장(Reply) 기반 매물 수정 기능
@@ -1032,16 +1102,16 @@ class TelegramNotionBot:
         self, reply_message
     ) -> Optional[str]:
         """답장 대상 메시지에서 노션 페이지 ID 추출
-        (✅ 메시지 또는 원본 매물 게시물 모두 지원)
+        (원본 매물 게시물 지원)
         """
         msg_id = reply_message.message_id
 
-        # 1. 저장된 매핑에서 찾기 (원본 게시물 / ✅ 메시지 모두)
+        # 1. 저장된 매핑에서 찾기
         if msg_id in self._page_mapping:
             return self._page_mapping[msg_id]
 
         # 2. 텍스트에서 Notion URL 추출 (봇 재시작 후 매핑 없을 때)
-        text = reply_message.text or ""
+        text = reply_message.text or reply_message.caption or ""
         if "notion.so" in text:
             match = re.search(r'([a-f0-9]{32})', text)
             if match:
@@ -1060,298 +1130,124 @@ class TelegramNotionBot:
         section_text: str,
     ) -> Dict[str, str]:
         """수정 섹션 텍스트에서 {필드라벨: 변경이력} 추출
-
-        예: "  💎권리금: 4000 → 3000"
-        → {"💎권리금": "4000 → 3000"}
+        (이 함수는 더 이상 사용하지 않음 - 답장 수정 방식 제거)
         """
-        result = {}
-        for line in section_text.split("\n"):
-            line = line.strip()
-            if not line or line.startswith("📝"):
-                continue
-            match = re.match(r'(.+?):\s*(.+)', line)
-            if match:
-                result[match.group(1).strip()] = (
-                    match.group(2).strip()
-                )
-        return result
+        return {}
 
-    def _build_updated_confirm_text(
-        self, old_text: str,
-        변경_dict: Dict[str, str],
-        now: str, page_url: str,
-    ) -> str:
-        """기존 ✅ 메시지에 수정 내역 반영
-        (체인 이력 지원 + 이전 수정, 최대 2건)
-
-        Args:
-            변경_dict: {필드라벨: "old → new"} 형태
-        """
-        # ── 🔗 링크 파트 분리 ──
-        if "🔗" in old_text:
-            link_idx = old_text.index("🔗")
-            link_part = old_text[link_idx:]
-        else:
-            link_part = (
-                f"🔗 {page_url}\n\n"
-                f"💡 이 메시지에 답장하면 매물 수정\n"
-                f"   특이사항 🔄 전체교체\n"
-                f"   특이사항+ ➕ 기존내용에 이어쓰기"
+    async def handle_edited_message(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ):
+        """채널 메시지 수정 감지 및 노션 자동 업데이트"""
+        message = update.effective_message
+        if not message:
+            return
+        
+        msg_id = message.message_id
+        
+        # 무한루프 방지: 봇이 수정한 메시지면 무시
+        if msg_id in self._bot_editing:
+            self._bot_editing.discard(msg_id)
+            logger.debug(f"봇 수정 무시: msg_id={msg_id}")
+            return
+        
+        # 매핑된 페이지가 없으면 무시 (노션에 등록된 매물이 아님)
+        if msg_id not in self._page_mapping:
+            return
+        
+        page_id = self._page_mapping[msg_id]
+        current_text = message.text or message.caption or ""
+        
+        # 구분선으로 매물 정보만 추출
+        property_text = self._extract_property_text(current_text)
+        
+        # 이전 매물 텍스트와 비교
+        old_property_text = self._original_texts.get(msg_id, "")
+        
+        # 변경 없으면 무시 (봇이 추가한 수정 이력만 변경된 경우)
+        if property_text == old_property_text:
+            logger.debug(f"매물 정보 변경 없음: msg_id={msg_id}")
+            return
+        
+        # 매물 형식인지 확인
+        if not self._is_listing_format(property_text, is_update=True):
+            return
+        
+        logger.info(f"매물 수정 감지: msg_id={msg_id}")
+        
+        try:
+            # 기존 노션 데이터 조회
+            old_data = self.notion_uploader.get_page_properties(page_id)
+            
+            # 수정된 매물 정보 파싱
+            new_property_data = self.parser.parse_property_info(
+                property_text, skip_address=True
             )
-            link_idx = len(old_text)
-
-        # ── 기존 수정 이력 파싱 ──
-        old_최근 = {}
-        old_최근_time = ""
-        old_이전 = {}
-
-        if "📝 최근 수정" in old_text:
-            최근_시작 = old_text.index("📝 최근 수정")
-            최근_끝 = link_idx
-            for boundary in ["┈", "📝 이전 수정"]:
-                try:
-                    b_idx = old_text.index(
-                        boundary, 최근_시작 + 1
-                    )
-                    if b_idx < 최근_끝:
-                        최근_끝 = b_idx
-                except ValueError:
-                    pass
-
-            최근_text = old_text[최근_시작:최근_끝].strip()
-            time_match = re.search(r'\((.+?)\)', 최근_text)
-            if time_match:
-                old_최근_time = time_match.group(1)
-            old_최근 = self._parse_change_section(최근_text)
-            base_part = old_text[:최근_시작].rstrip()
-        else:
-            base_part = old_text[:link_idx].rstrip()
-
-        if "📝 이전 수정" in old_text:
-            이전_시작 = old_text.index("📝 이전 수정")
-            이전_text = old_text[이전_시작:link_idx].strip()
-            old_이전 = self._parse_change_section(이전_text)
-
-        # ── 체인 병합 ──
-        merged = {}
-        for field, new_chain in 변경_dict.items():
-            if field in old_최근:
-                # 기존 체인에 새 값 추가
-                old_chain = old_최근[field]
-                new_end = new_chain.split("→")[-1].strip()
-                merged[field] = f"{old_chain} → {new_end}"
-            elif field in old_이전:
-                old_chain = old_이전[field]
-                new_end = new_chain.split("→")[-1].strip()
-                merged[field] = f"{old_chain} → {new_end}"
-            else:
-                merged[field] = new_chain
-
-        # ── 최근 수정 빌드 (한 줄로) ──
-        최근_items_str = ", ".join(
-            [f"{f} {c}" for f, c in merged.items()]
-        )
-        수정_섹션 = f"📝 수정 ({now}): {최근_items_str}"
-
-        # ── 이전 수정: old 최근 중 이번에 안 건드린 항목 (한 줄로) ──
-        이전_items = {
-            f: c
-            for f, c in old_최근.items()
-            if f not in 변경_dict
-        }
-        if 이전_items and old_최근_time:
-            이전_items_str = ", ".join(
-                [f"{f}" for f in 이전_items.keys()]
+            
+            if not new_property_data:
+                return
+            
+            # 특이사항 추가 모드는 원본 수정에서는 지원 안 함
+            new_property_data.pop("특이사항_추가", None)
+            
+            # 노션 업데이트
+            page_url = self.notion_uploader.update_property(
+                page_id, new_property_data
             )
-            수정_섹션 += f"\n📝 이전 ({old_최근_time}): {이전_items_str}"
-
-        return f"{base_part}\n\n{수정_섹션}\n\n{link_part}"
+            
+            # 변경 요약 생성
+            summary = self._build_update_summary(old_data, new_property_data)
+            now = datetime.now().strftime("%m/%d %H:%M")
+            update_log = f"🔄 {now} {summary}"
+            
+            # 기존 수정 이력 유지
+            existing_logs = ""
+            if self.DIVIDER in current_text:
+                below_divider = current_text.split(self.DIVIDER, 1)[1]
+                for line in below_divider.split("\n"):
+                    if line.strip().startswith("🔄"):
+                        existing_logs += f"\n{line.strip()}"
+            
+            # 원본 메시지에 수정 이력 추가
+            all_logs = update_log
+            if existing_logs:
+                all_logs += existing_logs
+            
+            notion_section = self._build_notion_section(
+                page_url, page_id, all_logs
+            )
+            new_full_text = property_text + notion_section
+            
+            # 현재 텍스트를 저장 (다음 비교용) - 수정 전에 저장
+            self._original_texts[msg_id] = property_text
+            
+            # 무한루프 방지 플래그 설정
+            self._bot_editing.add(msg_id)
+            
+            # 메시지 수정
+            try:
+                if message.caption is not None:
+                    await message.edit_caption(caption=new_full_text)
+                else:
+                    await message.edit_text(new_full_text)
+            except Exception as edit_err:
+                logger.warning(f"수정 이력 업데이트 실패: {edit_err}")
+                self._bot_editing.discard(msg_id)
+            
+            logger.info(f"매물 자동 수정 완료: {summary}")
+            
+        except Exception as e:
+            logger.error(f"메시지 수정 처리 오류: {e}", exc_info=True)
+            self._bot_editing.discard(msg_id)
 
     async def _handle_update(
         self, message, page_id: str, context
     ):
-        """답장 메시지로 노션 매물 정보 수정 (기존 ✅ 메시지 수정)"""
-        text = message.caption or message.text
-        reply_msg = message.reply_to_message
-
-        if not text:
-            await message.reply_text(
-                "❌ 수정할 내용이 없습니다.\n"
-                "수정할 항목을 텍스트로 보내주세요."
-            )
-            return
-
-        try:
-            # 수정 모드로 파싱 (첫 줄도 데이터로 처리)
-            property_data = self.parser.parse_property_info(
-                text, skip_address=True
-            )
-
-            if not property_data:
-                await message.reply_text(
-                    "❌ 수정할 내용을 인식하지 못했습니다."
-                )
-                return
-
-            loading_msg = await message.reply_text(
-                "⏳ 노션 매물 정보 수정 중..."
-            )
-
-            # ── 수정 전 기존 값 조회 ──
-            old_data = (
-                self.notion_uploader.get_page_properties(page_id)
-            )
-
-            # ── 특이사항 추가(+) 모드 처리 ──
-            특이사항_is_append = property_data.pop(
-                "특이사항_추가", False
-            )
-            if 특이사항_is_append and "특이사항" in property_data:
-                old_special = old_data.get("특이사항", "")
-                if old_special:
-                    property_data["특이사항"] = (
-                        old_special + "\n"
-                        + property_data["특이사항"]
-                    )
-
-            page_url = self.notion_uploader.update_property(
-                page_id, property_data
-            )
-
-            # ── 변경 전→후 비교 (변경_dict 생성) ──
-            field_names = {
-                "보증금": "💰보증금",
-                "월세": "💰월세",
-                "부가세": "🧾부가세",
-                "관리비": "⚡관리비",
-                "권리금": "💎권리금",
-                "건축물용도": "🏢건축물용도",
-                "계약면적": "📐계약면적",
-                "전용면적": "📐전용면적",
-                "주차": "🅿️주차",
-                "방향": "📍방향",
-                "화장실 위치": "🚻화장실 위치",
-                "화장실 수": "🚻화장실 수",
-                "위반건축물": "🚨위반건축물",
-                "대표 연락처": "📞연락처",
-                "특이사항": "📢특이사항",
-            }
-            변경_dict = {}
-            for key, label in field_names.items():
-                if key not in property_data:
-                    continue
-                new_val = property_data[key]
-                old_val = old_data.get(key)
-
-                # 특이사항은 긴 텍스트 → 간단하게 표시
-                if key == "특이사항":
-                    if str(old_val or "") != str(new_val):
-                        if 특이사항_is_append:
-                            변경_dict[label] = "추가됨"
-                        else:
-                            변경_dict[label] = "수정됨"
-                    continue
-
-                # 숫자 비교 (float→int 변환)
-                if (
-                    isinstance(old_val, (int, float))
-                    and isinstance(new_val, (int, float))
-                ):
-                    if old_val != new_val:
-                        old_disp = (
-                            int(old_val)
-                            if isinstance(old_val, float)
-                            and old_val == int(old_val)
-                            else old_val
-                        )
-                        변경_dict[label] = (
-                            f"{old_disp} → {new_val}"
-                        )
-                elif old_val is not None:
-                    if str(old_val) != str(new_val):
-                        변경_dict[label] = (
-                            f"{old_val} → {new_val}"
-                        )
-                else:
-                    # 기존에 없던 값이 새로 추가
-                    변경_dict[label] = str(new_val)
-
-            if not 변경_dict:
-                변경_dict["📋내용"] = "수정됨"
-
-            now = datetime.now().strftime("%m/%d")
-
-            # ── 기존 ✅ 메시지를 찾아서 수정 ──
-            edited_ok = False
-
-            # 방법 1: reply_msg 가 ✅ 메시지인 경우 (직접 수정)
-            if (
-                reply_msg
-                and reply_msg.text
-                and "✅" in reply_msg.text
-            ):
-                try:
-                    new_text = self._build_updated_confirm_text(
-                        reply_msg.text, 변경_dict,
-                        now, page_url,
-                    )
-                    await reply_msg.edit_text(new_text)
-                    if page_id in self._confirm_msg_info:
-                        self._confirm_msg_info[page_id][
-                            "text"
-                        ] = new_text
-                    edited_ok = True
-                except Exception as e:
-                    logger.warning(
-                        f"✅ 메시지 직접 수정 실패: {e}"
-                    )
-
-            # 방법 2: 원본 게시물에 답장한 경우 → 저장된 ✅ 메시지 수정
-            if not edited_ok and page_id in self._confirm_msg_info:
-                info = self._confirm_msg_info[page_id]
-                try:
-                    new_text = self._build_updated_confirm_text(
-                        info["text"], 변경_dict,
-                        now, page_url,
-                    )
-                    await context.bot.edit_message_text(
-                        chat_id=info["chat_id"],
-                        message_id=info["message_id"],
-                        text=new_text,
-                    )
-                    info["text"] = new_text
-                    edited_ok = True
-                except Exception as e:
-                    logger.warning(
-                        f"✅ 메시지 간접 수정 실패: {e}"
-                    )
-
-            # 방법 3: ✅ 메시지를 찾을 수 없으면 새 메시지 전송
-            if not edited_ok:
-                변경_items_str = ", ".join(
-                    [f"{k} {v}" for k, v in 변경_dict.items()]
-                )
-                await message.reply_text(
-                    f"✅ 노션 등록완료\n"
-                    f"🔗 {page_url}\n\n"
-                    f"📝 수정 ({now}): {변경_items_str}"
-                )
-
-            # ── 중간 메시지 삭제 ──
-            try:
-                await loading_msg.delete()
-            except Exception:
-                pass
-
-            # ── 수정 요청 메시지 삭제 (채널 깔끔 유지) ──
-            try:
-                await message.delete()
-            except Exception:
-                pass
-
-        except Exception as e:
-            logger.error(f"매물 수정 오류: {e}", exc_info=True)
-            await message.reply_text(f"❌ 수정 오류: {str(e)}")
+        """답장 메시지로 노션 매물 정보 수정 (더 이상 사용하지 않음)"""
+        # 원본 수정으로 대체되었으므로 사용하지 않음
+        await message.reply_text(
+            "💡 원본 메시지를 직접 수정하면 노션에도 자동 반영됩니다!"
+        )
+        return
 
     # ──────────────────────────────────────────────
     # 명령어 핸들러
@@ -1365,6 +1261,7 @@ class TelegramNotionBot:
             await message.reply_text(
                 "👋 안녕하세요\\! 부동산 매물 등록 봇입니다\\.\n\n"
                 "사진과 매물 정보를 보내주시면 자동으로 노션에 등록합니다\\.\n"
+                "원본 메시지를 수정하면 노션에도 자동 반영됩니다\\!\n\n"
                 "/help 로 사용법을 확인하세요\\!",
                 parse_mode="MarkdownV2",
             )
@@ -1378,6 +1275,106 @@ class TelegramNotionBot:
                 self.HELP_TEXT, parse_mode="MarkdownV2"
             )
 
+    async def check_command(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ):
+        """텔레그램 매물과 노션 매물 동기화 체크"""
+        message = update.effective_message
+        if not message:
+            return
+        
+        try:
+            status_msg = await message.reply_text(
+                "⏳ 노션 매물 확인 중...\n"
+                "(텔레그램 메시지는 메모리에 있는 것만 확인됩니다)"
+            )
+            
+            # 현재 메모리에 있는 텔레그램 매물 (봇 실행 후 등록된 것들)
+            telegram_properties = {}  # {주소: 메시지ID}
+            
+            for msg_id, page_id in self._page_mapping.items():
+                if msg_id in self._original_texts:
+                    text = self._original_texts[msg_id]
+                    lines = text.strip().split("\n")
+                    if lines:
+                        address = lines[0].strip()
+                        telegram_properties[address] = msg_id
+            
+            # 노션 데이터베이스에서 모든 매물 주소 수집
+            notion_properties = {}  # {주소: 페이지ID}
+            
+            has_more = True
+            start_cursor = None
+            
+            while has_more:
+                query_params = {
+                    "database_id": self.notion_uploader.database_id,
+                    "page_size": 100,
+                }
+                if start_cursor:
+                    query_params["start_cursor"] = start_cursor
+                
+                response = self.notion_uploader.client.databases.query(
+                    **query_params
+                )
+                
+                for page in response.get("results", []):
+                    props = page.get("properties", {})
+                    title_prop = props.get("주소 및 상호", {})
+                    title_list = title_prop.get("title", [])
+                    
+                    if title_list:
+                        address = title_list[0].get("text", {}).get("content", "")
+                        if address:
+                            notion_properties[address] = page["id"]
+                
+                has_more = response.get("has_more", False)
+                start_cursor = response.get("next_cursor")
+            
+            # 비교 결과 생성
+            telegram_count = len(telegram_properties)
+            notion_count = len(notion_properties)
+            
+            telegram_addrs = set(telegram_properties.keys())
+            notion_addrs = set(notion_properties.keys())
+            
+            missing_in_notion = telegram_addrs - notion_addrs
+            missing_in_telegram = notion_addrs - telegram_addrs
+            
+            # 결과 메시지 생성
+            result_text = "📊 매물 동기화 체크 결과\n\n"
+            result_text += f"📱 텔레그램 매물 (봇 실행 후): {telegram_count}개\n"
+            result_text += f"📝 노션 매물 (전체): {notion_count}개\n"
+            
+            if missing_in_notion:
+                result_text += f"\n⚠️ 노션에 없는 매물 ({len(missing_in_notion)}개):\n"
+                for addr in sorted(missing_in_notion)[:10]:
+                    result_text += f"  • {addr}\n"
+                if len(missing_in_notion) > 10:
+                    result_text += f"  ... 외 {len(missing_in_notion) - 10}개\n"
+            
+            if telegram_count > 0:
+                sync_rate = len(telegram_addrs & notion_addrs) / telegram_count * 100
+                result_text += f"\n✅ 동기화율: {sync_rate:.1f}%\n"
+            
+            if not missing_in_notion and telegram_count > 0:
+                result_text += "\n✅ 봇 실행 후 등록된 모든 매물이 동기화되어 있습니다!"
+            elif telegram_count == 0:
+                result_text += "\n💡 봇 실행 후 등록된 매물이 없습니다.\n"
+                result_text += f"   (노션에는 총 {notion_count}개 매물이 있습니다)"
+            else:
+                result_text += "\n💡 동기화되지 않은 매물을 확인하세요."
+            
+            result_text += "\n\n⚠️ 참고: 봇 실행 전 매물은 표시되지 않습니다."
+            
+            await status_msg.edit_text(result_text)
+            
+        except Exception as e:
+            logger.error(f"매물 체크 오류: {e}", exc_info=True)
+            await message.reply_text(
+                f"❌ 체크 중 오류 발생: {str(e)}"
+            )
+
     # ──────────────────────────────────────────────
     # 사진 메시지 처리
     # ──────────────────────────────────────────────
@@ -1385,27 +1382,10 @@ class TelegramNotionBot:
     async def handle_photo_message(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ):
-        """사진 메시지 처리 (그룹/채널 + 앨범/단일 사진 + 답장 수정)"""
+        """사진 메시지 처리 (그룹/채널 + 앨범/단일 사진)"""
         message = update.effective_message
         if not message:
             return
-
-        # 답장(Reply)인 경우 → 수정 처리
-        if message.reply_to_message:
-            page_id = self._get_page_id_from_reply(
-                message.reply_to_message
-            )
-            if page_id:
-                # 매물 형식(1.~8.)이 아닌 답장은 무시 (사적 대화)
-                reply_text = message.caption or message.text
-                if not self._is_listing_format(
-                    reply_text, is_update=True
-                ):
-                    return
-                await self._handle_update(
-                    message, page_id, context
-                )
-                return
 
         media_group_id = message.media_group_id
 
@@ -1439,25 +1419,31 @@ class TelegramNotionBot:
                     )
                 )
 
-                confirm_text = self._build_confirm_text(
-                    property_data, page_url, 1
-                )
-                confirm_msg = await message.reply_text(
-                    confirm_text
-                )
+                # 매핑 먼저 저장 (수정 이벤트보다 먼저)
+                self._page_mapping[message.message_id] = page_id
+                self._original_texts[message.message_id] = caption
 
-                # 매핑 저장 (✅ 메시지 + 원본 게시물)
-                self._page_mapping[
-                    confirm_msg.message_id
-                ] = page_id
-                self._page_mapping[
-                    message.message_id
-                ] = page_id
-                self._confirm_msg_info[page_id] = {
-                    "chat_id": confirm_msg.chat_id,
-                    "message_id": confirm_msg.message_id,
-                    "text": confirm_text,
-                }
+                # 원본 캡션에 노션 정보 추가
+                notion_section = self._build_notion_section(
+                    page_url, page_id
+                )
+                new_caption = caption + notion_section
+
+                # 무한루프 방지 플래그
+                self._bot_editing.add(message.message_id)
+                
+                try:
+                    await message.edit_caption(caption=new_caption)
+                except Exception as edit_err:
+                    logger.warning(
+                        f"원본 캡션 수정 실패: {edit_err}"
+                    )
+                    self._bot_editing.discard(message.message_id)
+                    # fallback: 답장으로 보내기
+                    await message.reply_text(
+                        f"✅ 노션 등록완료\n"
+                        f"🔗 {page_url}"
+                    )
 
                 # ⏳ 중간 메시지 삭제
                 try:
@@ -1545,25 +1531,31 @@ class TelegramNotionBot:
                 )
             )
 
-            confirm_text = self._build_confirm_text(
-                property_data, page_url, len(photo_urls)
-            )
-            confirm_msg = await message.reply_text(
-                confirm_text
-            )
+            # 매핑 먼저 저장 (수정 이벤트보다 먼저)
+            self._page_mapping[message.message_id] = page_id
+            self._original_texts[message.message_id] = caption
 
-            # 매핑 저장 (✅ 메시지 + 원본 게시물)
-            self._page_mapping[
-                confirm_msg.message_id
-            ] = page_id
-            self._page_mapping[
-                message.message_id
-            ] = page_id
-            self._confirm_msg_info[page_id] = {
-                "chat_id": confirm_msg.chat_id,
-                "message_id": confirm_msg.message_id,
-                "text": confirm_text,
-            }
+            # 원본 캡션에 노션 정보 추가
+            notion_section = self._build_notion_section(
+                page_url, page_id
+            )
+            new_caption = caption + notion_section
+
+            # 무한루프 방지 플래그
+            self._bot_editing.add(message.message_id)
+
+            try:
+                await message.edit_caption(caption=new_caption)
+            except Exception as edit_err:
+                logger.warning(
+                    f"앨범 원본 캡션 수정 실패: {edit_err}"
+                )
+                self._bot_editing.discard(message.message_id)
+                # fallback: 답장으로 보내기
+                await message.reply_text(
+                    f"✅ 노션 등록완료\n"
+                    f"🔗 {page_url}"
+                )
 
             # ⏳ 중간 메시지 삭제
             try:
@@ -1582,27 +1574,11 @@ class TelegramNotionBot:
     async def handle_text_message(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ):
-        """텍스트 전용 메시지 처리 (그룹/채널 + 답장 수정)"""
+        """텍스트 전용 메시지 처리 (그룹/채널)"""
         message = update.effective_message
         if not message:
             return
         text = message.text or message.caption
-
-        # 답장(Reply)인 경우 → 수정 처리
-        if message.reply_to_message:
-            page_id = self._get_page_id_from_reply(
-                message.reply_to_message
-            )
-            if page_id:
-                # 매물 형식(1.~8.)이 아닌 답장은 무시 (사적 대화)
-                if not self._is_listing_format(
-                    text, is_update=True
-                ):
-                    return
-                await self._handle_update(
-                    message, page_id, context
-                )
-                return
 
         # 매물 형식(1. 2. 3...)이 아니면 조용히 무시
         if not self._is_listing_format(text):
@@ -1619,25 +1595,31 @@ class TelegramNotionBot:
                 self.notion_uploader.upload_property(property_data)
             )
 
-            confirm_text = self._build_confirm_text(
-                property_data, page_url, 0
-            )
-            confirm_msg = await message.reply_text(
-                confirm_text
-            )
+            # 매핑 먼저 저장 (수정 이벤트보다 먼저)
+            self._page_mapping[message.message_id] = page_id
+            self._original_texts[message.message_id] = text
 
-            # 매핑 저장 (✅ 메시지 + 원본 게시물)
-            self._page_mapping[
-                confirm_msg.message_id
-            ] = page_id
-            self._page_mapping[
-                message.message_id
-            ] = page_id
-            self._confirm_msg_info[page_id] = {
-                "chat_id": confirm_msg.chat_id,
-                "message_id": confirm_msg.message_id,
-                "text": confirm_text,
-            }
+            # 원본 텍스트에 노션 정보 추가
+            notion_section = self._build_notion_section(
+                page_url, page_id
+            )
+            new_text = text + notion_section
+
+            # 무한루프 방지 플래그
+            self._bot_editing.add(message.message_id)
+
+            try:
+                await message.edit_text(new_text)
+            except Exception as edit_err:
+                logger.warning(
+                    f"원본 텍스트 수정 실패: {edit_err}"
+                )
+                self._bot_editing.discard(message.message_id)
+                # fallback: 답장으로 보내기
+                await message.reply_text(
+                    f"✅ 노션 등록완료\n"
+                    f"🔗 {page_url}"
+                )
 
             # ⏳ 중간 메시지 삭제
             try:
@@ -1670,12 +1652,47 @@ class TelegramNotionBot:
             .build()
         )
 
-        # 명령어 핸들러
+        # 명령어 핸들러 (일반 메시지)
         application.add_handler(
             CommandHandler("start", self.start_command)
         )
         application.add_handler(
             CommandHandler("help", self.help_command)
+        )
+        application.add_handler(
+            CommandHandler("check", self.check_command)
+        )
+
+        # 명령어 핸들러 (채널 포스트)
+        application.add_handler(
+            MessageHandler(
+                filters.Regex(r"^/start")
+                & filters.UpdateType.CHANNEL_POST,
+                self.start_command,
+            )
+        )
+        application.add_handler(
+            MessageHandler(
+                filters.Regex(r"^/help")
+                & filters.UpdateType.CHANNEL_POST,
+                self.help_command,
+            )
+        )
+        application.add_handler(
+            MessageHandler(
+                filters.Regex(r"^/check")
+                & filters.UpdateType.CHANNEL_POST,
+                self.check_command,
+            )
+        )
+
+        # 채널/그룹 메시지 수정 감지
+        application.add_handler(
+            MessageHandler(
+                filters.UpdateType.EDITED_CHANNEL_POST
+                | filters.UpdateType.EDITED_MESSAGE,
+                self.handle_edited_message,
+            )
         )
 
         # 사진 메시지 (그룹 + 채널)
@@ -1712,9 +1729,10 @@ class TelegramNotionBot:
             )
             print("📷 여러 장 사진 앨범도 지원됩니다!")
             print(
-                "✏️ 등록 확인 메시지에 답장하면 "
-                "매물 정보를 수정할 수 있습니다!"
+                "✏️ 원본 메시지를 수정하면 "
+                "노션에도 자동으로 반영됩니다!"
             )
+            print("/check 명령어로 동기화 상태를 확인할 수 있습니다.")
         except UnicodeEncodeError:
             print("[BOT] 봇이 시작되었습니다...")
             print(
