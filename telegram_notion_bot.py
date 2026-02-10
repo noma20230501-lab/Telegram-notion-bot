@@ -579,6 +579,12 @@ class NotionUploader:
                 "select": {"name": property_data["위반건축물"]}
             }
 
+        # ── 매물접수 (select) ──
+        if "매물접수" in property_data:
+            properties["매물접수"] = {
+                "select": {"name": property_data["매물접수"]}
+            }
+
         # ── 📅등록 날짜 (date) - 신규 등록 시에만 ──
         if not is_update:
             properties["📅등록 날짜"] = {
@@ -1007,8 +1013,29 @@ class TelegramNotionBot:
         self._page_mapping: Dict[int, str] = {}
         # 메시지 ID → 원본 매물 텍스트 (변경 감지용)
         self._original_texts: Dict[int, str] = {}
-        # 무한루프 방지: 봇이 수정 중인 메시지 ID
-        self._bot_editing: set = set()
+
+        # 매물접수자 이름 목록 (노션 셀렉트 옵션과 일치해야 함)
+        self._staff_names = [
+            "박진우", "김동영", "임정묵",
+            "김태훈", "한지훈", "허종찬", "고동기",
+        ]
+
+    def _match_staff_name(self, signature: str) -> Optional[str]:
+        """채널 서명에서 매물접수자 이름 매칭
+
+        Args:
+            signature: message.author_signature 값
+
+        Returns:
+            매칭된 이름 또는 None
+        """
+        if not signature:
+            return None
+        sig = signature.strip()
+        for name in self._staff_names:
+            if name in sig:
+                return name
+        return None
 
     @staticmethod
     def _is_listing_format(
@@ -1107,12 +1134,12 @@ class TelegramNotionBot:
         if use_html:
             section = (
                 f"\n\n{TelegramNotionBot.DIVIDER}\n"
-                f'✅ <a href="{page_url}">노션 등록완료</a> 📋'
+                f'✅ <a href="{page_url}">Notion</a>'
             )
         else:
             section = (
                 f"\n\n{TelegramNotionBot.DIVIDER}\n"
-                f"✅ 노션 등록완료\n"
+                f"✅ Notion\n"
                 f"🔗 {page_url}"
             )
         if update_log:
@@ -1239,13 +1266,6 @@ class TelegramNotionBot:
             return
         
         msg_id = message.message_id
-        
-        # 무한루프 방지: 봇이 수정한 메시지면 무시
-        if msg_id in self._bot_editing:
-            self._bot_editing.discard(msg_id)
-            logger.debug(f"봇 수정 무시: msg_id={msg_id}")
-            return
-        
         current_text = message.text or message.caption or ""
         
         # 매핑된 페이지가 없으면 메시지에서 복구 시도
@@ -1350,24 +1370,18 @@ class TelegramNotionBot:
             # 현재 텍스트를 저장 (다음 비교용) - 수정 전에 저장
             self._original_texts[msg_id] = property_text
             
-            # 무한루프 방지 플래그 설정
-            self._bot_editing.add(msg_id)
-            
             # 메시지 수정 (HTML 시도 → 실패 시 plain text)
             is_caption = message.caption is not None
-            success = await self._safe_edit_message(
+            await self._safe_edit_message(
                 message, property_text,
                 notion_html, notion_plain,
                 is_caption=is_caption,
             )
-            if not success:
-                self._bot_editing.discard(msg_id)
             
             logger.info(f"매물 자동 수정 완료: {summary}")
             
         except Exception as e:
             logger.error(f"메시지 수정 처리 오류: {e}", exc_info=True)
-            self._bot_editing.discard(msg_id)
 
     async def _handle_update(
         self, message, page_id: str, context
@@ -1536,6 +1550,13 @@ class TelegramNotionBot:
                 )
                 property_data["원본 메시지"] = caption
 
+                # 채널 서명에서 매물접수자 자동 추출
+                staff = self._match_staff_name(
+                    message.author_signature
+                )
+                if staff:
+                    property_data["매물접수"] = staff
+
                 photo = message.photo[-1]
                 photo_file = await photo.get_file()
                 photo_url = photo_file.file_path
@@ -1561,16 +1582,12 @@ class TelegramNotionBot:
                     page_url, page_id, use_html=False
                 )
 
-                # 무한루프 방지 플래그
-                self._bot_editing.add(message.message_id)
-                
                 success = await self._safe_edit_message(
                     message, caption,
                     notion_html, notion_plain,
                     is_caption=True,
                 )
                 if not success:
-                    self._bot_editing.discard(message.message_id)
                     await message.reply_text(
                         f"✅ 노션 등록완료\n"
                         f"🔗 {page_url}"
@@ -1600,6 +1617,7 @@ class TelegramNotionBot:
                 "photos": [],
                 "caption": None,
                 "message": message,
+                "author_signature": message.author_signature,
             }
 
         # 사진 추가 (가장 큰 해상도)
@@ -1653,6 +1671,12 @@ class TelegramNotionBot:
             property_data = self.parser.parse_property_info(caption)
             property_data["원본 메시지"] = caption
 
+            # 채널 서명에서 매물접수자 자동 추출
+            author_sig = group_data.get("author_signature")
+            staff = self._match_staff_name(author_sig)
+            if staff:
+                property_data["매물접수"] = staff
+
             loading_msg = await message.reply_text(
                 f"⏳ 노션에 등록 중... (사진 {len(photo_urls)}장)"
             )
@@ -1674,16 +1698,12 @@ class TelegramNotionBot:
                 page_url, page_id, use_html=False
             )
 
-            # 무한루프 방지 플래그
-            self._bot_editing.add(message.message_id)
-
             success = await self._safe_edit_message(
                 message, caption,
                 notion_html, notion_plain,
                 is_caption=True,
             )
             if not success:
-                self._bot_editing.discard(message.message_id)
                 await message.reply_text(
                     f"✅ 노션 등록완료\n"
                     f"🔗 {page_url}"
@@ -1720,6 +1740,13 @@ class TelegramNotionBot:
             property_data = self.parser.parse_property_info(text)
             property_data["원본 메시지"] = text
 
+            # 채널 서명에서 매물접수자 자동 추출
+            staff = self._match_staff_name(
+                message.author_signature
+            )
+            if staff:
+                property_data["매물접수"] = staff
+
             loading_msg = await message.reply_text(
                 "⏳ 노션에 등록 중..."
             )
@@ -1739,16 +1766,12 @@ class TelegramNotionBot:
                 page_url, page_id, use_html=False
             )
 
-            # 무한루프 방지 플래그
-            self._bot_editing.add(message.message_id)
-
             success = await self._safe_edit_message(
                 message, text,
                 notion_html, notion_plain,
                 is_caption=False,
             )
             if not success:
-                self._bot_editing.discard(message.message_id)
                 await message.reply_text(
                     f"✅ 노션 등록완료\n"
                     f"🔗 {page_url}"
