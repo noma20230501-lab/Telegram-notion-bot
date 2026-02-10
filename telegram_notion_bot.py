@@ -1021,35 +1021,8 @@ class TelegramNotionBot:
     def _build_confirm_text(
         property_data: Dict, page_url: str, photo_count: int
     ) -> str:
-        """✅ 등록 확인 메시지 텍스트 생성"""
-        보증금 = property_data.get("보증금", "-")
-        월세 = property_data.get("월세", "-")
-        관리비 = property_data.get("관리비", "")
-        권리금_val = property_data.get("권리금")
-
-        info_lines = [f"💰 가격: {보증금}/{월세}"]
-        if 관리비:
-            info_lines.append(f"⚡ 관리비: {관리비}")
-        if 권리금_val is not None:
-            권리금_text = (
-                "무권리" if 권리금_val == 0
-                else f"{권리금_val}만원"
-            )
-            info_lines.append(f"💎 권리금: {권리금_text}")
-        photo_text = (
-            f"{photo_count}장" if photo_count > 0
-            else "없음"
-        )
-        info_lines.append(f"📷 사진: {photo_text}")
-
-        return (
-            f"✅ 노션에 등록되었습니다!\n\n"
-            + "\n".join(info_lines) + "\n\n"
-            + f"🔗 {page_url}\n\n"
-            + f"💡 이 메시지에 답장하면 매물 수정\n"
-            + f"   특이사항 🔄 전체교체\n"
-            + f"   특이사항+ ➕ 기존내용에 이어쓰기"
-        )
+        """✅ 등록 확인 메시지 텍스트 생성 (짧은 버전)"""
+        return f"✅ 노션 등록완료\n🔗 {page_url}"
 
     # ──────────────────────────────────────────────
     # 답장(Reply) 기반 매물 수정 기능
@@ -1174,30 +1147,23 @@ class TelegramNotionBot:
             else:
                 merged[field] = new_chain
 
-        # ── 최근 수정 빌드 ──
-        최근_lines = [
-            f"  {f}: {c}" for f, c in merged.items()
-        ]
-        수정_섹션 = (
-            f"📝 최근 수정 ({now}):\n"
-            + "\n".join(최근_lines)
+        # ── 최근 수정 빌드 (한 줄로) ──
+        최근_items_str = ", ".join(
+            [f"{f} {c}" for f, c in merged.items()]
         )
+        수정_섹션 = f"📝 수정 ({now}): {최근_items_str}"
 
-        # ── 이전 수정: old 최근 중 이번에 안 건드린 항목 ──
+        # ── 이전 수정: old 최근 중 이번에 안 건드린 항목 (한 줄로) ──
         이전_items = {
             f: c
             for f, c in old_최근.items()
             if f not in 변경_dict
         }
         if 이전_items and old_최근_time:
-            이전_lines = [
-                f"  {f}: {c}" for f, c in 이전_items.items()
-            ]
-            수정_섹션 += (
-                f"\n\n┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈\n"
-                f"📝 이전 수정 ({old_최근_time}):\n"
-                + "\n".join(이전_lines)
+            이전_items_str = ", ".join(
+                [f"{f}" for f in 이전_items.keys()]
             )
+            수정_섹션 += f"\n📝 이전 ({old_최근_time}): {이전_items_str}"
 
         return f"{base_part}\n\n{수정_섹션}\n\n{link_part}"
 
@@ -1313,7 +1279,7 @@ class TelegramNotionBot:
             if not 변경_dict:
                 변경_dict["📋내용"] = "수정됨"
 
-            now = datetime.now().strftime("%m/%d %H:%M")
+            now = datetime.now().strftime("%m/%d")
 
             # ── 기존 ✅ 메시지를 찾아서 수정 ──
             edited_ok = False
@@ -1362,14 +1328,13 @@ class TelegramNotionBot:
 
             # 방법 3: ✅ 메시지를 찾을 수 없으면 새 메시지 전송
             if not edited_ok:
-                변경_text = "\n".join(
-                    f"  {k}: {v}"
-                    for k, v in 변경_dict.items()
+                변경_items_str = ", ".join(
+                    [f"{k} {v}" for k, v in 변경_dict.items()]
                 )
                 await message.reply_text(
-                    f"✅ 노션 매물 정보가 수정되었습니다!\n\n"
-                    f"📝 변경 항목:\n{변경_text}\n\n"
-                    f"🔗 {page_url}"
+                    f"✅ 노션 등록완료\n"
+                    f"🔗 {page_url}\n\n"
+                    f"📝 수정 ({now}): {변경_items_str}"
                 )
 
             # ── 중간 메시지 삭제 ──
