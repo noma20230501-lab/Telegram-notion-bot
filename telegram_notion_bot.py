@@ -1020,7 +1020,7 @@ class TelegramNotionBot:
             "김태훈", "한지훈", "허종찬", "고동기",
         ]
 
-    def _match_staff_name(self, signature: str) -> Optional[str]:
+    def _match_staff_name(self, signature: Optional[str]) -> Optional[str]:
         """채널 서명에서 매물접수자 이름 매칭
 
         Args:
@@ -1030,11 +1030,25 @@ class TelegramNotionBot:
             매칭된 이름 또는 None
         """
         if not signature:
+            logger.debug("author_signature가 없음")
             return None
+        
         sig = signature.strip()
+        logger.info(f"서명 매칭 시도: '{sig}'")
+        
+        # 1. 정확한 매칭: 서명에 전체 이름이 포함되어 있는지
         for name in self._staff_names:
             if name in sig:
+                logger.info(f"매칭 성공: '{sig}' → '{name}'")
                 return name
+        
+        # 2. 역방향 매칭: 서명이 이름의 일부인지 (예: "박진" → "박진우")
+        for name in self._staff_names:
+            if sig in name:
+                logger.info(f"역방향 매칭 성공: '{sig}' → '{name}'")
+                return name
+        
+        logger.warning(f"매칭 실패: '{sig}' (등록된 이름: {self._staff_names})")
         return None
 
     @staticmethod
