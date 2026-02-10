@@ -7,6 +7,7 @@
 import os
 import re
 import sys
+import html
 import asyncio
 import logging
 from datetime import datetime
@@ -874,6 +875,24 @@ class NotionUploader:
             props = page.get("properties", {})
             result = {}
 
+            # 주소 (title)
+            if "주소 및 상호" in props:
+                title_arr = props["주소 및 상호"].get(
+                    "title", []
+                )
+                if title_arr:
+                    result["주소"] = (
+                        title_arr[0]
+                        .get("text", {})
+                        .get("content", "")
+                    )
+
+            # 층수 (multi_select)
+            if "층수" in props:
+                ms = props["층수"].get("multi_select", [])
+                if ms:
+                    result["층수"] = ms[0].get("name", "")
+
             # 숫자 속성
             for key, notion_key in [
                 ("보증금", "💰보증금"),
@@ -1024,6 +1043,48 @@ class TelegramNotionBot:
     DIVIDER = "━━━━━━━━━━━━━━"  # 구분선
 
     @staticmethod
+    async def _safe_edit_message(
+        message, property_text: str, notion_section_html: str,
+        notion_section_plain: str, is_caption: bool = False,
+    ):
+        """HTML 모드로 메시지 수정 시도 → 실패 시 plain text fallback
+
+        Args:
+            message: 텔레그램 메시지 객체
+            property_text: 매물 정보 원본 텍스트
+            notion_section_html: HTML 하이퍼링크 포함 노션 섹션
+            notion_section_plain: plain text 노션 섹션 (fallback)
+            is_caption: True면 edit_caption, False면 edit_text
+        """
+        # HTML 모드: 매물 텍스트를 이스케이프하고 노션 섹션은 HTML 유지
+        escaped_text = html.escape(property_text)
+        html_full = escaped_text + notion_section_html
+
+        try:
+            if is_caption:
+                await message.edit_caption(
+                    caption=html_full, parse_mode="HTML"
+                )
+            else:
+                await message.edit_text(
+                    html_full, parse_mode="HTML"
+                )
+            return True
+        except Exception as e:
+            logger.warning(f"HTML 모드 실패, plain text로 전환: {e}")
+            # Fallback: plain text (기존 방식)
+            plain_full = property_text + notion_section_plain
+            try:
+                if is_caption:
+                    await message.edit_caption(caption=plain_full)
+                else:
+                    await message.edit_text(plain_full)
+                return True
+            except Exception as e2:
+                logger.error(f"메시지 수정 실패: {e2}")
+                return False
+
+    @staticmethod
     def _extract_property_text(message_text: str) -> str:
         """메시지에서 구분선 위쪽(매물 정보)만 추출"""
         if TelegramNotionBot.DIVIDER in message_text:
@@ -1032,14 +1093,28 @@ class TelegramNotionBot:
 
     @staticmethod
     def _build_notion_section(
-        page_url: str, page_id: str, update_log: str = ""
+        page_url: str, page_id: str, update_log: str = "",
+        use_html: bool = True,
     ) -> str:
-        """구분선 아래 노션 정보 섹션 생성"""
-        section = (
-            f"\n\n{TelegramNotionBot.DIVIDER}\n"
-            f"✅ 노션 등록완료\n"
-            f"🔗 {page_url}"
-        )
+        """구분선 아래 노션 정보 섹션 생성
+
+        Args:
+            page_url: 노션 페이지 URL
+            page_id: 노션 페이지 ID
+            update_log: 수정 이력 문자열
+            use_html: True면 HTML 하이퍼링크, False면 plain text
+        """
+        if use_html:
+            section = (
+                f"\n\n{TelegramNotionBot.DIVIDER}\n"
+                f'✅ <a href="{page_url}">노션 등록완료</a> 📋'
+            )
+        else:
+            section = (
+                f"\n\n{TelegramNotionBot.DIVIDER}\n"
+                f"✅ 노션 등록완료\n"
+                f"🔗 {page_url}"
+            )
         if update_log:
             section += f"\n{update_log}"
         return section
@@ -1053,6 +1128,8 @@ class TelegramNotionBot:
         """
         changes = []
         field_names = {
+            "주소": "주소",
+            "층수": "층수",
             "보증금": "보증금",
             "월세": "월세",
             "부가세": "부가세",
@@ -1110,10 +1187,25 @@ class TelegramNotionBot:
         if msg_id in self._page_mapping:
             return self._page_mapping[msg_id]
 
-        # 2. 텍스트에서 Notion URL 추출 (봇 재시작 후 매핑 없을 때)
+        # 2. 텍스트 또는 entities에서 Notion URL 추출
         text = reply_message.text or reply_message.caption or ""
+        notion_url = ""
         if "notion.so" in text:
-            match = re.search(r'([a-f0-9]{32})', text)
+            notion_url = text
+        
+        # HTML 하이퍼링크에서 URL 추출
+        entities = (
+            reply_message.entities
+            or reply_message.caption_entities
+            or []
+        )
+        for ent in entities:
+            if ent.type == "text_link" and ent.url and "notion.so" in ent.url:
+                notion_url = ent.url
+                break
+        
+        if notion_url:
+            match = re.search(r'([a-f0-9]{32})', notion_url)
             if match:
                 raw_id = match.group(1)
                 page_id = (
@@ -1156,24 +1248,38 @@ class TelegramNotionBot:
         
         current_text = message.text or message.caption or ""
         
-        # 매핑된 페이지가 없으면 메시지 텍스트에서 복구 시도
+        # 매핑된 페이지가 없으면 메시지에서 복구 시도
         if msg_id not in self._page_mapping:
-            # 구분선 + 노션 URL이 있는 메시지만 처리 (이미 등록된 매물)
-            if self.DIVIDER in current_text and "notion.so" in current_text:
-                match = re.search(r'([a-f0-9]{32})', current_text)
-                if match:
-                    raw_id = match.group(1)
-                    page_id = (
-                        f"{raw_id[:8]}-{raw_id[8:12]}"
-                        f"-{raw_id[12:16]}"
-                        f"-{raw_id[16:20]}-{raw_id[20:]}"
-                    )
-                    self._page_mapping[msg_id] = page_id
-                    logger.info(
-                        f"매핑 복구: msg_id={msg_id} → {page_id}"
-                    )
-                else:
-                    return
+            if self.DIVIDER not in current_text:
+                return
+            
+            # 1) 텍스트에서 노션 URL 찾기 (plain text fallback 경우)
+            notion_url = ""
+            if "notion.so" in current_text:
+                notion_url = current_text
+            
+            # 2) entities에서 text_link 찾기 (HTML 하이퍼링크 경우)
+            entities = message.entities or message.caption_entities or []
+            for ent in entities:
+                if ent.type == "text_link" and ent.url and "notion.so" in ent.url:
+                    notion_url = ent.url
+                    break
+            
+            if not notion_url:
+                return
+            
+            match = re.search(r'([a-f0-9]{32})', notion_url)
+            if match:
+                raw_id = match.group(1)
+                page_id = (
+                    f"{raw_id[:8]}-{raw_id[8:12]}"
+                    f"-{raw_id[12:16]}"
+                    f"-{raw_id[16:20]}-{raw_id[20:]}"
+                )
+                self._page_mapping[msg_id] = page_id
+                logger.info(
+                    f"매핑 복구: msg_id={msg_id} → {page_id}"
+                )
             else:
                 return
         
@@ -1200,9 +1306,9 @@ class TelegramNotionBot:
             # 기존 노션 데이터 조회
             old_data = self.notion_uploader.get_page_properties(page_id)
             
-            # 수정된 매물 정보 파싱
+            # 수정된 매물 정보 파싱 (주소 포함)
             new_property_data = self.parser.parse_property_info(
-                property_text, skip_address=True
+                property_text, skip_address=False
             )
             
             if not new_property_data:
@@ -1234,10 +1340,12 @@ class TelegramNotionBot:
             if existing_logs:
                 all_logs += existing_logs
             
-            notion_section = self._build_notion_section(
-                page_url, page_id, all_logs
+            notion_html = self._build_notion_section(
+                page_url, page_id, all_logs, use_html=True
             )
-            new_full_text = property_text + notion_section
+            notion_plain = self._build_notion_section(
+                page_url, page_id, all_logs, use_html=False
+            )
             
             # 현재 텍스트를 저장 (다음 비교용) - 수정 전에 저장
             self._original_texts[msg_id] = property_text
@@ -1245,14 +1353,14 @@ class TelegramNotionBot:
             # 무한루프 방지 플래그 설정
             self._bot_editing.add(msg_id)
             
-            # 메시지 수정
-            try:
-                if message.caption is not None:
-                    await message.edit_caption(caption=new_full_text)
-                else:
-                    await message.edit_text(new_full_text)
-            except Exception as edit_err:
-                logger.warning(f"수정 이력 업데이트 실패: {edit_err}")
+            # 메시지 수정 (HTML 시도 → 실패 시 plain text)
+            is_caption = message.caption is not None
+            success = await self._safe_edit_message(
+                message, property_text,
+                notion_html, notion_plain,
+                is_caption=is_caption,
+            )
+            if not success:
                 self._bot_editing.discard(msg_id)
             
             logger.info(f"매물 자동 수정 완료: {summary}")
@@ -1446,22 +1554,23 @@ class TelegramNotionBot:
                 self._original_texts[message.message_id] = caption
 
                 # 원본 캡션에 노션 정보 추가
-                notion_section = self._build_notion_section(
-                    page_url, page_id
+                notion_html = self._build_notion_section(
+                    page_url, page_id, use_html=True
                 )
-                new_caption = caption + notion_section
+                notion_plain = self._build_notion_section(
+                    page_url, page_id, use_html=False
+                )
 
                 # 무한루프 방지 플래그
                 self._bot_editing.add(message.message_id)
                 
-                try:
-                    await message.edit_caption(caption=new_caption)
-                except Exception as edit_err:
-                    logger.warning(
-                        f"원본 캡션 수정 실패: {edit_err}"
-                    )
+                success = await self._safe_edit_message(
+                    message, caption,
+                    notion_html, notion_plain,
+                    is_caption=True,
+                )
+                if not success:
                     self._bot_editing.discard(message.message_id)
-                    # fallback: 답장으로 보내기
                     await message.reply_text(
                         f"✅ 노션 등록완료\n"
                         f"🔗 {page_url}"
@@ -1558,22 +1667,23 @@ class TelegramNotionBot:
             self._original_texts[message.message_id] = caption
 
             # 원본 캡션에 노션 정보 추가
-            notion_section = self._build_notion_section(
-                page_url, page_id
+            notion_html = self._build_notion_section(
+                page_url, page_id, use_html=True
             )
-            new_caption = caption + notion_section
+            notion_plain = self._build_notion_section(
+                page_url, page_id, use_html=False
+            )
 
             # 무한루프 방지 플래그
             self._bot_editing.add(message.message_id)
 
-            try:
-                await message.edit_caption(caption=new_caption)
-            except Exception as edit_err:
-                logger.warning(
-                    f"앨범 원본 캡션 수정 실패: {edit_err}"
-                )
+            success = await self._safe_edit_message(
+                message, caption,
+                notion_html, notion_plain,
+                is_caption=True,
+            )
+            if not success:
                 self._bot_editing.discard(message.message_id)
-                # fallback: 답장으로 보내기
                 await message.reply_text(
                     f"✅ 노션 등록완료\n"
                     f"🔗 {page_url}"
@@ -1622,22 +1732,23 @@ class TelegramNotionBot:
             self._original_texts[message.message_id] = text
 
             # 원본 텍스트에 노션 정보 추가
-            notion_section = self._build_notion_section(
-                page_url, page_id
+            notion_html = self._build_notion_section(
+                page_url, page_id, use_html=True
             )
-            new_text = text + notion_section
+            notion_plain = self._build_notion_section(
+                page_url, page_id, use_html=False
+            )
 
             # 무한루프 방지 플래그
             self._bot_editing.add(message.message_id)
 
-            try:
-                await message.edit_text(new_text)
-            except Exception as edit_err:
-                logger.warning(
-                    f"원본 텍스트 수정 실패: {edit_err}"
-                )
+            success = await self._safe_edit_message(
+                message, text,
+                notion_html, notion_plain,
+                is_caption=False,
+            )
+            if not success:
                 self._bot_editing.discard(message.message_id)
-                # fallback: 답장으로 보내기
                 await message.reply_text(
                     f"✅ 노션 등록완료\n"
                     f"🔗 {page_url}"
