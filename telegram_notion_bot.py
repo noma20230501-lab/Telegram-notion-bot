@@ -55,7 +55,15 @@ class PropertyParser:
 
         start_idx = 0
         if not skip_address and lines:
-            data["주소"] = lines[0].strip()
+            주소_line = lines[0].strip()
+            data["주소"] = 주소_line
+            
+            # 매물 유형 감지: (복층), (통상가)
+            if "(복층)" in 주소_line:
+                data["매물_유형"] = "복층"
+            elif "(통상가)" in 주소_line:
+                data["매물_유형"] = "통상가"
+            
             start_idx = 1
 
         special_notes = []
@@ -197,28 +205,54 @@ class PropertyParser:
                 else:
                     data["권리금 메모"] = rights_text
 
-            # 4. 건축물용도 / 면적
+            # 4. 건축물용도 / 면적 (복층/통상가 지원)
             elif line.startswith("4."):
                 content4 = re.sub(r"^4\.\s*", "", line).strip()
 
-                계약_match = re.search(
-                    r"계약(?:면적)?\s*(\d+\.?\d*)\s*(?:m2|㎡)",
-                    content4,
+                # 층별 구분 체크 (1층, 2층 등 키워드 있는지)
+                층별_패턴 = re.findall(
+                    r'(\d+)층[^/]*?'
+                    r'계(?:약)?(?:면적)?\s*(\d+\.?\d*)\s*(?:m2|㎡)?[^/]*?'
+                    r'전(?:용)?(?:면적)?\s*(\d+\.?\d*)\s*(?:m2|㎡)?[^/]*?'
+                    r'(\d+)\s*평',
+                    content4
                 )
-                if 계약_match:
-                    data["계약면적"] = float(계약_match.group(1))
+                
+                if 층별_패턴:
+                    # 복층/통상가 매물
+                    총_계약 = 0
+                    총_전용 = 0
+                    층별_평수 = []
+                    
+                    for 층, 계약, 전용, 평 in 층별_패턴:
+                        총_계약 += float(계약) if 계약 else 0
+                        총_전용 += float(전용) if 전용 else 0
+                        층별_평수.append(f"{층}층 {평}평")
+                    
+                    data["계약면적"] = 총_계약
+                    data["전용면적"] = 총_전용
+                    data["층별면적상세"] = ", ".join(층별_평수)
+                else:
+                    # 일반 매물 (기존 로직)
+                    계약_match = re.search(
+                        r"계약(?:면적)?\s*(\d+\.?\d*)\s*(?:m2|㎡)",
+                        content4,
+                    )
+                    if 계약_match:
+                        data["계약면적"] = float(계약_match.group(1))
 
-                전용_match = re.search(
-                    r"전용(?:면적)?\s*(\d+\.?\d*)\s*(?:m2|㎡)",
-                    content4,
-                )
-                if 전용_match:
-                    data["전용면적"] = float(전용_match.group(1))
+                    전용_match = re.search(
+                        r"전용(?:면적)?\s*(\d+\.?\d*)\s*(?:m2|㎡)",
+                        content4,
+                    )
+                    if 전용_match:
+                        data["전용면적"] = float(전용_match.group(1))
 
                 # 건축물용도: "계약(면적)" 또는 "전용(면적)" 앞의 텍스트 추출
                 용도_text = re.split(
                     r'\s*/\s*계약(?:면적)?|\s+계약(?:면적)?'
-                    r'|\s*/\s*전용(?:면적)?|\s+전용(?:면적)?',
+                    r'|\s*/\s*전용(?:면적)?|\s+전용(?:면적)?'
+                    r'|\s*\d+층',
                     content4,
                 )[0].strip().rstrip(' /')
                 if 용도_text:
@@ -529,6 +563,12 @@ class NotionUploader:
                 }
             }
 
+        # ── 🏢 매물 유형 (select) ──
+        if "매물_유형" in property_data:
+            properties["🏢 매물 유형"] = {
+                "select": {"name": property_data["매물_유형"]}
+            }
+
         # ── 📐계약면적(m²) (number) ──
         if "계약면적" in property_data:
             properties["📐계약면적(m²)"] = {
@@ -539,6 +579,14 @@ class NotionUploader:
         if "전용면적" in property_data:
             properties["📐전용면적(m²)"] = {
                 "number": property_data["전용면적"]
+            }
+
+        # ── 📐 층별면적상세 (rich_text) ──
+        if "층별면적상세" in property_data:
+            properties["📐 층별면적상세"] = {
+                "rich_text": [
+                    {"text": {"content": property_data["층별면적상세"]}}
+                ]
             }
 
         # ── 🅿️주차 (select) ──
