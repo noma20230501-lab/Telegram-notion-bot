@@ -351,7 +351,8 @@ class PropertyParser:
                         pmemo = re.sub(
                             r'^주차\s*[는은]?\s*', '', parking_text
                         ).strip()
-                        pmemo = re.sub(r'^[oO가능]\s*', '', pmemo).strip()
+                        # "o", "O", "ㅇ", "가능" 제거
+                        pmemo = re.sub(r'^[oOㅇ가능]\s*', '', pmemo).strip()
                         pmemo = re.sub(r'^가능\s*', '', pmemo).strip()
                         pmemo = re.sub(r'^장\s*사용', '주차장', pmemo)
                         
