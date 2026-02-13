@@ -58,11 +58,14 @@ class PropertyParser:
             주소_line = lines[0].strip()
             data["주소"] = 주소_line
             
-            # 매물 유형 감지: (복층), (통상가)
-            if "(복층)" in 주소_line:
-                data["매물_유형"] = "복층"
-            elif "(통상가)" in 주소_line:
-                data["매물_유형"] = "통상가"
+            # 매물 유형 감지: 괄호 안에 "복층" 또는 "통상가" 포함
+            괄호_내용 = re.search(r'\(([^)]+)\)', 주소_line)
+            if 괄호_내용:
+                내용 = 괄호_내용.group(1)
+                if "복층" in 내용:
+                    data["매물_유형"] = "복층"
+                elif "통상가" in 내용:
+                    data["매물_유형"] = "통상가"
             
             # 소재지(구) 추출: 중구, 동구, 서구, 남구, 북구, 수성구, 달서구, 달성군
             구_match = re.search(r'(중구|동구|서구|남구|북구|수성구|달서구|달성군)', 주소_line)
@@ -333,30 +336,38 @@ class PropertyParser:
                 parking_text = " ".join(parking_parts).strip()
 
                 # 주차 판단
-                if parking_text:
+                if parking_text and "주차" in parking_text:
+                    # "주차 불가", "주차X", "주차 안 됨" → 불가능
                     if re.search(
                         r'주차\s*[xX]|주차\s*불가|주차\s*안\s*됨',
                         parking_text,
                     ):
                         data["주차"] = "불가능"
                     else:
+                        # 그 외 ("주차 가능", "주차 o", "주차(매장앞1대)" 등) → 가능
                         data["주차"] = "가능"
+                        
                         # 주차 메모 추출
                         pmemo = re.sub(
                             r'^주차\s*[는은]?\s*', '', parking_text
                         ).strip()
-                        pmemo = re.sub(r'^[oO]\s*', '', pmemo).strip()
+                        pmemo = re.sub(r'^[oO가능]\s*', '', pmemo).strip()
+                        pmemo = re.sub(r'^가능\s*', '', pmemo).strip()
                         pmemo = re.sub(r'^장\s*사용', '주차장', pmemo)
-                        pmemo = pmemo.replace('(', ' ').replace(')', '')
-                        pmemo = re.sub(r'가능\S*', '', pmemo).strip()
+                        
+                        # 괄호 내용은 유지하되 괄호만 제거
+                        pmemo = pmemo.replace('(', '').replace(')', '')
+                        
                         pmemo = re.sub(
                             r'하긴한데|애매|선착순', '', pmemo
                         ).strip()
+                        
                         # 한글과 숫자 사이 공백 추가 (기계식60대 → 기계식 60대)
                         pmemo = re.sub(
                             r'([가-힣])(\d)', r'\1 \2', pmemo
                         )
                         pmemo = re.sub(r'\s+', ' ', pmemo).strip()
+                        
                         if pmemo:
                             data["주차 메모"] = pmemo
 
@@ -576,17 +587,20 @@ class NotionUploader:
             end = int(범위_match.group(2))
             층_list = [f"{i}층" for i in range(start, end + 1)]
         else:
-            # 2. 콤마 구분 형식: "1,2,3층" (층 앞에 콤마 있는지 확인)
+            # 2. 콤마 구분 형식: "1,2,3층"
             콤마_match = re.search(r'(\d+(?:,\d+)+)층', 주소)
             if 콤마_match:
-                # "1,2,3" → ["1", "2", "3"]
                 층_numbers = 콤마_match.group(1).split(',')
                 층_list = [f"{층.strip()}층" for 층 in 층_numbers]
             else:
-                # 3. 개별 형식: "1층", "2층" (마지막 하나만)
-                층_match = re.search(r'(\d+)층', 주소)
-                if 층_match:
-                    층_list = [f"{층_match.group(1)}층"]
+                # 3. 연속 층 형식: "2층3층" 또는 "1층 2층 3층" (띄어쓰기 0~2개)
+                연속_matches = re.findall(r'(\d+)층', 주소)
+                if len(연속_matches) > 1:
+                    # 여러 층이 감지되면 모두 추가
+                    층_list = [f"{층}층" for 층 in 연속_matches]
+                elif len(연속_matches) == 1:
+                    # 4. 단일 층 형식: "1층"
+                    층_list = [f"{연속_matches[0]}층"]
         
         if 층_list:
             properties["층수"] = {
