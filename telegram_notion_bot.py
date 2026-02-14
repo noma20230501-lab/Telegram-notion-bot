@@ -821,6 +821,14 @@ class NotionUploader:
             properties["거래 상태"] = {
                 "select": {"name": "거래 가능"}
             }
+        
+        # ── 거래완료 시점 (rich_text) ──
+        if "거래완료_시점" in property_data:
+            properties["거래완료 시점"] = {
+                "rich_text": [
+                    {"text": {"content": property_data["거래완료_시점"]}}
+                ]
+            }
 
         return properties
 
@@ -1349,7 +1357,6 @@ class TelegramNotionBot:
             "매물_유형": "매물유형",
             "소재지_구": "소재지",
             "임대_구분": "임대구분",
-            "거래_상태": "거래상태",
         }
         
         for key, label in field_names.items():
@@ -1369,6 +1376,17 @@ class TelegramNotionBot:
             else:
                 # 새로 추가
                 changes.append(f"{label}:{new_val}")
+        
+        # 거래 상태 체크 (특별 처리)
+        if "거래_상태" in new_data:
+            old_status = old_data.get("거래_상태")
+            new_status = new_data["거래_상태"]
+            if old_status != new_status:
+                # 거래완료 시점도 함께 표시
+                if "거래완료_시점" in new_data:
+                    changes.append(f"거래완료({new_data['거래완료_시점']})")
+                else:
+                    changes.append(f"거래상태:{new_status}")
         
         # 특이사항 체크
         if "특이사항" in new_data:
@@ -1490,13 +1508,17 @@ class TelegramNotionBot:
         # 이전 매물 텍스트와 비교 (매핑 복구 시 이전 텍스트 없으면 무조건 업데이트)
         old_property_text = self._original_texts.get(msg_id, "")
         
-        # 변경 없으면 무시 (봇이 추가한 수정 이력만 변경된 경우)
-        if property_text == old_property_text:
+        # 거래 완료 체크 (전체 메시지에서 체크 - 구분선 아래 포함)
+        current_text_no_space = current_text.replace(" ", "").replace("\n", "")
+        has_deal_completed = "거래완료" in current_text_no_space or "계약완료" in current_text_no_space
+        
+        # 변경 없고 거래완료도 없으면 무시
+        if property_text == old_property_text and not has_deal_completed:
             logger.debug(f"매물 정보 변경 없음: msg_id={msg_id}")
             return
         
-        # 매물 형식인지 확인
-        if not self._is_listing_format(property_text, is_update=True):
+        # 매물 형식인지 확인 (거래완료만 있는 경우는 패스)
+        if property_text != old_property_text and not self._is_listing_format(property_text, is_update=True):
             return
         
         logger.info(f"매물 수정 감지: msg_id={msg_id}")
@@ -1506,21 +1528,30 @@ class TelegramNotionBot:
             old_data = self.notion_uploader.get_page_properties(page_id)
             
             # 수정된 매물 정보 파싱 (주소 포함)
-            new_property_data = self.parser.parse_property_info(
-                property_text, skip_address=False
-            )
+            new_property_data = {}
+            if property_text != old_property_text:
+                # 매물 정보가 변경된 경우에만 파싱
+                new_property_data = self.parser.parse_property_info(
+                    property_text, skip_address=False
+                )
+                if not new_property_data:
+                    new_property_data = {}
+                # 특이사항 추가 모드는 원본 수정에서는 지원 안 함
+                new_property_data.pop("특이사항_추가", None)
             
+            # 거래 완료 처리 (구분선 위/아래 모두 체크)
+            if has_deal_completed:
+                # 이전에 거래완료가 아니었다면 새로 거래완료 처리
+                if old_data.get("거래_상태") != "거래 완료":
+                    new_property_data["거래_상태"] = "거래 완료"
+                    # 거래완료 시점 기록
+                    now = datetime.now()
+                    new_property_data["거래완료_시점"] = now.strftime("%Y-%m-%d %H:%M")
+                    logger.info(f"거래 완료 감지: msg_id={msg_id}, 시점={new_property_data['거래완료_시점']}")
+            
+            # 노션에 업데이트할 내용이 없으면 종료
             if not new_property_data:
                 return
-            
-            # 특이사항 추가 모드는 원본 수정에서는 지원 안 함
-            new_property_data.pop("특이사항_추가", None)
-            
-            # 거래 완료 체크 (띄어쓰기 무시하고 전체 텍스트에서 체크)
-            property_text_no_space = property_text.replace(" ", "").replace("\n", "")
-            if "거래완료" in property_text_no_space or "계약완료" in property_text_no_space:
-                new_property_data["거래_상태"] = "거래 완료"
-                logger.info(f"거래 완료 감지: msg_id={msg_id}")
             
             # 노션 업데이트
             page_url = self.notion_uploader.update_property(
