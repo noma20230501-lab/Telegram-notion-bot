@@ -811,8 +811,13 @@ class NotionUploader:
                 "phone_number": property_data["추가 연락처2"]
             }
 
-        # ── 거래 상태 (select) - 신규 등록 시에만 ──
-        if not is_update:
+        # ── 거래 상태 (select) ──
+        if "거래_상태" in property_data:
+            properties["거래 상태"] = {
+                "select": {"name": property_data["거래_상태"]}
+            }
+        elif not is_update:
+            # 신규 등록 시에만 기본값 설정
             properties["거래 상태"] = {
                 "select": {"name": "거래 가능"}
             }
@@ -1079,6 +1084,7 @@ class NotionUploader:
                 ("매물_유형", "🏢 매물 유형"),
                 ("소재지_구", "📍소재지(구)"),
                 ("임대_구분", "임대 구분"),
+                ("거래_상태", "거래 상태"),
             ]:
                 if notion_key in props:
                     sel = props[notion_key].get("select")
@@ -1343,6 +1349,7 @@ class TelegramNotionBot:
             "매물_유형": "매물유형",
             "소재지_구": "소재지",
             "임대_구분": "임대구분",
+            "거래_상태": "거래상태",
         }
         
         for key, label in field_names.items():
@@ -1508,6 +1515,12 @@ class TelegramNotionBot:
             
             # 특이사항 추가 모드는 원본 수정에서는 지원 안 함
             new_property_data.pop("특이사항_추가", None)
+            
+            # 거래 완료 체크 (띄어쓰기 무시하고 전체 텍스트에서 체크)
+            property_text_no_space = property_text.replace(" ", "").replace("\n", "")
+            if "거래완료" in property_text_no_space or "계약완료" in property_text_no_space:
+                new_property_data["거래_상태"] = "거래 완료"
+                logger.info(f"거래 완료 감지: msg_id={msg_id}")
             
             # 노션 업데이트
             page_url = self.notion_uploader.update_property(
