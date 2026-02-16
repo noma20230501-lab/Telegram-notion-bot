@@ -554,6 +554,22 @@ class NotionUploader:
         self.client = Client(auth=notion_token)
         self.database_id = database_id
 
+    def ensure_sync_properties(self):
+        """동기화에 필요한 Notion 속성 생성 (없으면 추가)"""
+        try:
+            self.client.databases.update(
+                database_id=self.database_id,
+                properties={
+                    "telegram_chat_id": {"number": {}},
+                    "telegram_msg_id": {"number": {}},
+                },
+            )
+            logger.info("동기화용 Notion 속성 확인 완료")
+        except Exception as e:
+            logger.warning(
+                f"동기화 속성 생성/확인 실패 (무시): {e}"
+            )
+
     def _build_notion_properties(
         self, property_data: Dict, is_update: bool = False
     ) -> Dict:
@@ -830,6 +846,16 @@ class NotionUploader:
                 ]
             }
 
+        # ── 텔레그램 동기화 정보 (number) ──
+        if "telegram_chat_id" in property_data:
+            properties["telegram_chat_id"] = {
+                "number": property_data["telegram_chat_id"]
+            }
+        if "telegram_msg_id" in property_data:
+            properties["telegram_msg_id"] = {
+                "number": property_data["telegram_msg_id"]
+            }
+
         return properties
 
     def upload_property(
@@ -1039,6 +1065,26 @@ class NotionUploader:
             logger.error(f"노션 업데이트 실패: {e}")
             raise Exception(f"노션 업데이트 실패: {str(e)}")
 
+    def archive_property(self, page_id: str) -> bool:
+        """
+        노션 페이지를 아카이브(삭제) 처리
+
+        Args:
+            page_id: 아카이브할 노션 페이지 ID
+
+        Returns:
+            성공 여부
+        """
+        try:
+            self.client.pages.update(
+                page_id=page_id, archived=True
+            )
+            logger.info(f"노션 페이지 아카이브 완료: {page_id}")
+            return True
+        except Exception as e:
+            logger.error(f"노션 아카이브 실패: {e}")
+            raise Exception(f"노션 아카이브 실패: {str(e)}")
+
     def get_page_properties(self, page_id: str) -> Dict:
         """노션 페이지의 현재 속성값을 파싱하여 반환"""
         try:
@@ -1128,6 +1174,79 @@ class NotionUploader:
             logger.warning(f"페이지 속성 조회 실패: {e}")
             return {}
 
+    def get_tracked_pages(self) -> List[Dict]:
+        """동기화 추적 중인 모든 노션 페이지 조회
+
+        Returns:
+            [{"page_id": str, "chat_id": int, "msg_id": int,
+              "title": str}, ...]
+        """
+        results = []
+        has_more = True
+        start_cursor = None
+
+        while has_more:
+            query_params = {
+                "database_id": self.database_id,
+                "page_size": 100,
+                "filter": {
+                    "property": "telegram_msg_id",
+                    "number": {"is_not_empty": True},
+                },
+            }
+            if start_cursor:
+                query_params["start_cursor"] = start_cursor
+
+            try:
+                response = self.client.databases.query(
+                    **query_params
+                )
+            except Exception as e:
+                logger.error(f"추적 페이지 조회 실패: {e}")
+                break
+
+            for page in response.get("results", []):
+                if page.get("archived"):
+                    continue
+                props = page.get("properties", {})
+
+                chat_id = None
+                msg_id = None
+                title = ""
+
+                if "telegram_chat_id" in props:
+                    chat_id = props["telegram_chat_id"].get(
+                        "number"
+                    )
+                if "telegram_msg_id" in props:
+                    msg_id = props["telegram_msg_id"].get(
+                        "number"
+                    )
+
+                title_prop = props.get("주소 및 상호", {})
+                title_list = title_prop.get("title", [])
+                if title_list:
+                    title = (
+                        title_list[0]
+                        .get("text", {})
+                        .get("content", "")
+                    )
+
+                if chat_id and msg_id:
+                    results.append(
+                        {
+                            "page_id": page["id"],
+                            "chat_id": int(chat_id),
+                            "msg_id": int(msg_id),
+                            "title": title,
+                        }
+                    )
+
+            has_more = response.get("has_more", False)
+            start_cursor = response.get("next_cursor")
+
+        return results
+
 
 class TelegramNotionBot:
     """텔레그램-노션 연동 봇 (앨범/여러 장 사진 + 원본 수정 자동 반영)"""
@@ -1159,10 +1278,17 @@ class TelegramNotionBot:
         "등록된 매물의 *원본 메시지를 직접 수정*하면\n"
         "노션에도 자동으로 반영됩니다\\!\n"
         "예: `1\\.3000/150 부별` → 보증금/월세/부가세 수정\n\n"
+        "📌 *삭제 방법:*\n"
+        "• 텔레그램에서 매물 메시지를 그냥 삭제하세요\\!\n"
+        "  → 4시간마다 자동 동기화로 노션에서도 삭제됩니다 🔄\n"
+        "• 즉시 삭제: `/동기화` 입력하면 바로 정리\n"
+        "• 개별 삭제: 매물에 답장으로 `/delete` 입력\n\n"
         "📌 *명령어:*\n"
         "/start \\- 봇 시작\n"
         "/help \\- 도움말 보기\n"
-        "/check \\- 매물 동기화 상태 확인"
+        "/check \\- 매물 동기화 상태 확인\n"
+        "/동기화 \\- 삭제된 매물 노션 정리 \\(수동\\)\n"
+        "/delete \\- 매물 개별 삭제 \\(답장으로 사용\\)"
     )
 
     def __init__(
@@ -1182,12 +1308,19 @@ class TelegramNotionBot:
         self._page_mapping: Dict[int, str] = {}
         # 메시지 ID → 원본 매물 텍스트 (변경 감지용)
         self._original_texts: Dict[int, str] = {}
+        # 메시지 ID → 채팅 ID (동기화 시 메시지 존재 확인용)
+        self._msg_chat_ids: Dict[int, int] = {}
+        # 동기화 중 플래그 (전달 메시지 무시용)
+        self._sync_in_progress = False
 
         # 매물접수자 이름 목록 (노션 셀렉트 옵션과 일치해야 함)
         self._staff_names = [
             "박진우", "김동영", "임정묵",
             "김태훈", "한지훈", "허종찬", "고동기",
         ]
+
+        # 동기화용 Notion 속성 초기화
+        self.notion_uploader.ensure_sync_properties()
 
     def _match_staff_name(self, signature: Optional[str]) -> Optional[str]:
         """채널 서명에서 매물접수자 이름 매칭
@@ -1494,6 +1627,7 @@ class TelegramNotionBot:
                     f"-{raw_id[16:20]}-{raw_id[20:]}"
                 )
                 self._page_mapping[msg_id] = page_id
+                self._msg_chat_ids[msg_id] = message.chat_id
                 logger.info(
                     f"매핑 복구: msg_id={msg_id} → {page_id}"
                 )
@@ -1736,6 +1870,90 @@ class TelegramNotionBot:
             )
 
     # ──────────────────────────────────────────────
+    # 매물 삭제 (텔레그램 + 노션)
+    # ──────────────────────────────────────────────
+
+    async def delete_command(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ):
+        """매물 삭제: 원본 매물 메시지에 답장으로 /delete 입력 시
+        노션 페이지를 아카이브하고 텔레그램 메시지도 삭제"""
+        message = update.effective_message
+        if not message:
+            return
+
+        # 답장 대상 메시지 확인
+        reply = message.reply_to_message
+        if not reply:
+            await message.reply_text(
+                "💡 삭제할 매물 메시지에 **답장(Reply)**으로 "
+                "/delete 를 입력해주세요.",
+                parse_mode="Markdown",
+            )
+            return
+
+        # 답장 대상에서 노션 페이지 ID 추출
+        page_id = self._get_page_id_from_reply(reply)
+        if not page_id:
+            await message.reply_text(
+                "⚠️ 이 메시지에 연결된 노션 페이지를 찾을 수 없습니다.\n"
+                "노션에 등록된 매물 메시지에만 사용할 수 있습니다."
+            )
+            return
+
+        try:
+            # 노션 페이지 제목 조회 (확인용)
+            page_props = self.notion_uploader.get_page_properties(page_id)
+            page_title = page_props.get("주소", "매물")
+
+            # 노션 페이지 아카이브
+            self.notion_uploader.archive_property(page_id)
+
+            # 매핑 정보 제거
+            reply_id = reply.message_id
+            self._page_mapping.pop(reply_id, None)
+            self._original_texts.pop(reply_id, None)
+            self._msg_chat_ids.pop(reply_id, None)
+
+            # 원본 매물 메시지 삭제 시도
+            deleted_msg = False
+            try:
+                await reply.delete()
+                deleted_msg = True
+            except Exception as e:
+                logger.warning(
+                    f"텔레그램 메시지 삭제 실패 (권한 부족): {e}"
+                )
+
+            # /delete 명령어 메시지도 삭제 시도
+            try:
+                await message.delete()
+            except Exception:
+                pass
+
+            # 결과 알림 (명령어 메시지 삭제 실패 시에만 표시)
+            if deleted_msg:
+                # 두 메시지 모두 삭제된 경우 → 알림 없이 깔끔하게 처리
+                # (만약 /delete 메시지 삭제 실패 시 아래 로그만 남김)
+                logger.info(
+                    f"매물 삭제 완료: '{page_title}' "
+                    f"(page_id={page_id})"
+                )
+            else:
+                # 텔레그램 메시지 삭제 실패 시 알림
+                await message.reply_text(
+                    f"✅ 노션에서 삭제 완료: {page_title}\n"
+                    f"⚠️ 텔레그램 메시지는 수동으로 삭제해주세요.\n"
+                    f"(봇에 메시지 삭제 권한이 필요합니다)"
+                )
+
+        except Exception as e:
+            logger.error(f"매물 삭제 오류: {e}", exc_info=True)
+            await message.reply_text(
+                f"❌ 삭제 중 오류 발생: {str(e)}"
+            )
+
+    # ──────────────────────────────────────────────
     # 사진 메시지 처리
     # ──────────────────────────────────────────────
 
@@ -1745,6 +1963,10 @@ class TelegramNotionBot:
         """사진 메시지 처리 (그룹/채널 + 앨범/단일 사진)"""
         message = update.effective_message
         if not message:
+            return
+
+        # 동기화 중 전달된 메시지 무시
+        if self._sync_in_progress and message.forward_origin:
             return
 
         media_group_id = message.media_group_id
@@ -1765,6 +1987,12 @@ class TelegramNotionBot:
                     caption
                 )
                 property_data["원본 메시지"] = caption
+
+                # 텔레그램 동기화 정보 저장
+                property_data["telegram_chat_id"] = message.chat_id
+                property_data["telegram_msg_id"] = (
+                    message.message_id
+                )
 
                 # 채널 서명에서 매물접수자 자동 추출
                 staff = self._match_staff_name(
@@ -1789,6 +2017,9 @@ class TelegramNotionBot:
                 # 매핑 먼저 저장 (수정 이벤트보다 먼저)
                 self._page_mapping[message.message_id] = page_id
                 self._original_texts[message.message_id] = caption
+                self._msg_chat_ids[message.message_id] = (
+                    message.chat_id
+                )
 
                 # 원본 캡션에 노션 정보 추가
                 notion_html = self._build_notion_section(
@@ -1887,6 +2118,12 @@ class TelegramNotionBot:
             property_data = self.parser.parse_property_info(caption)
             property_data["원본 메시지"] = caption
 
+            # 텔레그램 동기화 정보 저장
+            property_data["telegram_chat_id"] = message.chat_id
+            property_data["telegram_msg_id"] = (
+                message.message_id
+            )
+
             # 채널 서명에서 매물접수자 자동 추출
             author_sig = group_data.get("author_signature")
             staff = self._match_staff_name(author_sig)
@@ -1905,6 +2142,9 @@ class TelegramNotionBot:
             # 매핑 먼저 저장 (수정 이벤트보다 먼저)
             self._page_mapping[message.message_id] = page_id
             self._original_texts[message.message_id] = caption
+            self._msg_chat_ids[message.message_id] = (
+                message.chat_id
+            )
 
             # 원본 캡션에 노션 정보 추가
             notion_html = self._build_notion_section(
@@ -1936,6 +2176,263 @@ class TelegramNotionBot:
             await message.reply_text(f"❌ 오류 발생: {str(e)}")
 
     # ──────────────────────────────────────────────
+    # 텔레그램 ↔ 노션 동기화 (삭제 감지)
+    # ──────────────────────────────────────────────
+
+    # 자동 동기화 주기 (초) = 4시간
+    AUTO_SYNC_INTERVAL = 4 * 60 * 60
+
+    @staticmethod
+    async def _check_message_exists(
+        bot, chat_id: int, message_id: int
+    ) -> bool:
+        """텔레그램 메시지 존재 여부를 비파괴적으로 확인
+
+        edit_message_reply_markup 호출 결과로 판별:
+        - 메시지 존재: 'not modified' 에러 → True
+        - 메시지 삭제됨: 'not found' 에러 → False
+        """
+        try:
+            await bot.edit_message_reply_markup(
+                chat_id=chat_id,
+                message_id=message_id,
+            )
+            # 성공 시 → 메시지 존재 (리플라이 마크업 변경됨)
+            return True
+        except Exception as e:
+            err = str(e).lower()
+            if "not found" in err or "message to edit" in err:
+                return False
+            if "not modified" in err:
+                return True
+            if "message can't be edited" in err:
+                return True
+            if "there is no reply_markup" in err:
+                return True
+            # 네트워크 에러 등 → 안전하게 존재한다고 가정
+            logger.warning(
+                f"메시지 존재 확인 불확실 "
+                f"(chat={chat_id}, msg={message_id}): {e}"
+            )
+            return True
+
+    async def _sync_deleted_properties(
+        self, bot, report_chat_id: int = None
+    ) -> Dict:
+        """텔레그램에서 삭제된 매물을 노션에서 아카이브
+
+        Args:
+            bot: 텔레그램 봇 인스턴스
+            report_chat_id: 결과를 보고할 채팅 ID (None이면 무음)
+
+        Returns:
+            {"checked": int, "archived": int,
+             "archived_titles": List[str],
+             "notion_count": int, "memory_count": int}
+        """
+        self._sync_in_progress = True
+        result = {
+            "checked": 0,
+            "archived": 0,
+            "archived_titles": [],
+            "notion_count": 0,
+            "memory_count": 0,
+        }
+
+        try:
+            # ── 1단계: 노션 DB에서 추적 중인 페이지 조회 ──
+            tracked_pages = (
+                self.notion_uploader.get_tracked_pages()
+            )
+            result["notion_count"] = len(tracked_pages)
+            notion_msg_ids = {
+                p["msg_id"] for p in tracked_pages
+            }
+
+            # ── 2단계: 메모리 매핑도 추가 (중복 제거) ──
+            for msg_id, page_id in list(
+                self._page_mapping.items()
+            ):
+                if msg_id in notion_msg_ids:
+                    continue  # 노션에 이미 있으면 스킵
+                chat_id = self._msg_chat_ids.get(msg_id)
+                if not chat_id and report_chat_id:
+                    chat_id = report_chat_id
+                if chat_id:
+                    tracked_pages.append(
+                        {
+                            "page_id": page_id,
+                            "chat_id": int(chat_id),
+                            "msg_id": int(msg_id),
+                            "title": "(메모리)",
+                        }
+                    )
+                    result["memory_count"] += 1
+
+            logger.info(
+                f"동기화 시작: 총 {len(tracked_pages)}개 매물 "
+                f"(노션 {result['notion_count']}개 + "
+                f"메모리 {result['memory_count']}개)"
+            )
+
+            for page_info in tracked_pages:
+                page_id = page_info["page_id"]
+                chat_id = page_info["chat_id"]
+                msg_id = page_info["msg_id"]
+                title = page_info["title"] or "제목 없음"
+
+                result["checked"] += 1
+
+                # 메시지 존재 여부 확인
+                exists = await self._check_message_exists(
+                    bot, chat_id, msg_id
+                )
+
+                if not exists:
+                    # 텔레그램에서 삭제됨 → 노션 아카이브
+                    try:
+                        self.notion_uploader.archive_property(
+                            page_id
+                        )
+                        result["archived"] += 1
+                        result["archived_titles"].append(title)
+
+                        # 메모리 매핑도 정리
+                        self._page_mapping.pop(msg_id, None)
+                        self._original_texts.pop(msg_id, None)
+                        self._msg_chat_ids.pop(msg_id, None)
+
+                        logger.info(
+                            f"동기화 삭제: '{title}' "
+                            f"(msg_id={msg_id})"
+                        )
+                    except Exception as e:
+                        logger.error(
+                            f"동기화 아카이브 실패 "
+                            f"'{title}': {e}"
+                        )
+
+                # API 속도 제한 방지 (0.5초 간격)
+                await asyncio.sleep(0.5)
+
+            logger.info(
+                f"동기화 완료: {result['checked']}개 확인, "
+                f"{result['archived']}개 삭제"
+            )
+
+        except Exception as e:
+            logger.error(f"동기화 처리 오류: {e}", exc_info=True)
+        finally:
+            self._sync_in_progress = False
+
+        return result
+
+    async def sync_command(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ):
+        """/동기화 명령어: 수동으로 텔레그램-노션 동기화 실행"""
+        message = update.effective_message
+        if not message:
+            return
+
+        logger.info(
+            f"/동기화 명령어 수신 (chat_id={message.chat_id})"
+        )
+
+        mem_count = len(self._page_mapping)
+        status_msg = await message.reply_text(
+            "🔄 동기화 시작...\n"
+            f"메모리 추적 매물: {mem_count}개\n"
+            "노션 DB를 조회하고 텔레그램 메시지 존재 여부를 "
+            "확인합니다.\n"
+            "(매물 수에 따라 시간이 걸릴 수 있습니다)"
+        )
+
+        try:
+            result = await self._sync_deleted_properties(
+                context.bot,
+                report_chat_id=message.chat_id,
+            )
+
+            # 결과 메시지 생성
+            report = (
+                f"✅ 동기화 완료!\n\n"
+                f"📊 확인한 매물: {result['checked']}개\n"
+                f"  • 노션 DB 추적: "
+                f"{result['notion_count']}개\n"
+                f"  • 메모리 추적: "
+                f"{result['memory_count']}개\n"
+                f"🗑️ 삭제(아카이브): "
+                f"{result['archived']}개\n"
+            )
+
+            if result["archived_titles"]:
+                report += "\n삭제된 매물:\n"
+                for title in result["archived_titles"][:20]:
+                    report += f"  • {title}\n"
+                if len(result["archived_titles"]) > 20:
+                    extra = (
+                        len(result["archived_titles"]) - 20
+                    )
+                    report += f"  ... 외 {extra}개\n"
+
+            if result["checked"] == 0:
+                report += (
+                    "\n⚠️ 추적 중인 매물이 없습니다.\n"
+                    "이 코드 업데이트 이후 새로 등록된 "
+                    "매물부터 동기화가 가능합니다."
+                )
+            elif result["archived"] == 0:
+                report += (
+                    "\n💡 텔레그램에서 삭제된 매물이 없습니다. "
+                    "모든 매물이 정상입니다!"
+                )
+
+            await status_msg.edit_text(report)
+
+        except Exception as e:
+            logger.error(
+                f"수동 동기화 오류: {e}", exc_info=True
+            )
+            await status_msg.edit_text(
+                f"❌ 동기화 중 오류 발생: {str(e)}"
+            )
+
+    async def _post_init(self, application):
+        """봇 초기화 후 자동 동기화 백그라운드 태스크 시작"""
+        asyncio.create_task(
+            self._auto_sync_loop(application)
+        )
+        logger.info(
+            f"자동 동기화 태스크 시작 "
+            f"(주기: {self.AUTO_SYNC_INTERVAL // 3600}시간)"
+        )
+
+    async def _auto_sync_loop(self, application):
+        """백그라운드에서 주기적으로 동기화 실행"""
+        # 봇 시작 후 2분 대기 (초기화 안정화)
+        await asyncio.sleep(120)
+
+        while True:
+            try:
+                logger.info("⏰ 자동 동기화 실행 중...")
+                result = await self._sync_deleted_properties(
+                    application.bot
+                )
+                if result["archived"] > 0:
+                    logger.info(
+                        f"⏰ 자동 동기화: "
+                        f"{result['archived']}개 매물 삭제됨"
+                    )
+            except Exception as e:
+                logger.error(
+                    f"자동 동기화 오류: {e}", exc_info=True
+                )
+
+            # 다음 동기화까지 대기
+            await asyncio.sleep(self.AUTO_SYNC_INTERVAL)
+
+    # ──────────────────────────────────────────────
     # 텍스트 메시지 처리
     # ──────────────────────────────────────────────
 
@@ -1946,6 +2443,11 @@ class TelegramNotionBot:
         message = update.effective_message
         if not message:
             return
+
+        # 동기화 중 전달된 메시지 무시
+        if self._sync_in_progress and message.forward_origin:
+            return
+
         text = message.text or message.caption
 
         # 매물 형식(1. 2. 3...)이 아니면 조용히 무시
@@ -1955,6 +2457,10 @@ class TelegramNotionBot:
         try:
             property_data = self.parser.parse_property_info(text)
             property_data["원본 메시지"] = text
+
+            # 텔레그램 동기화 정보 저장
+            property_data["telegram_chat_id"] = message.chat_id
+            property_data["telegram_msg_id"] = message.message_id
 
             # 채널 서명에서 매물접수자 자동 추출
             staff = self._match_staff_name(
@@ -1973,6 +2479,9 @@ class TelegramNotionBot:
             # 매핑 먼저 저장 (수정 이벤트보다 먼저)
             self._page_mapping[message.message_id] = page_id
             self._original_texts[message.message_id] = text
+            self._msg_chat_ids[message.message_id] = (
+                message.chat_id
+            )
 
             # 원본 텍스트에 노션 정보 추가
             notion_html = self._build_notion_section(
@@ -2021,6 +2530,7 @@ class TelegramNotionBot:
         application = (
             Application.builder()
             .token(self.telegram_token)
+            .post_init(self._post_init)
             .build()
         )
 
@@ -2033,6 +2543,20 @@ class TelegramNotionBot:
         )
         application.add_handler(
             CommandHandler("check", self.check_command)
+        )
+        application.add_handler(
+            CommandHandler("delete", self.delete_command)
+        )
+        # 한글 명령어는 Regex로 처리
+        application.add_handler(
+            MessageHandler(
+                filters.Regex(r"^/동기화")
+                & (
+                    filters.UpdateType.MESSAGE
+                    | filters.UpdateType.CHANNEL_POST
+                ),
+                self.sync_command,
+            )
         )
 
         # 명령어 핸들러 (채널 포스트)
@@ -2055,6 +2579,13 @@ class TelegramNotionBot:
                 filters.Regex(r"^/check")
                 & filters.UpdateType.CHANNEL_POST,
                 self.check_command,
+            )
+        )
+        application.add_handler(
+            MessageHandler(
+                filters.Regex(r"^/delete")
+                & filters.UpdateType.CHANNEL_POST,
+                self.delete_command,
             )
         )
 
@@ -2107,7 +2638,18 @@ class TelegramNotionBot:
                 "✏️ 원본 메시지를 수정하면 "
                 "노션에도 자동으로 반영됩니다!"
             )
-            print("/check 명령어로 동기화 상태를 확인할 수 있습니다.")
+            print(
+                "🗑️ 매물 메시지에 답장으로 /delete → "
+                "노션+텔레그램 모두 삭제!"
+            )
+            print(
+                "🔄 4시간마다 자동 동기화 "
+                "(삭제된 매물 노션에서 정리)"
+            )
+            print(
+                "/동기화 명령어로 수동 동기화를 "
+                "실행할 수 있습니다."
+            )
         except UnicodeEncodeError:
             print("[BOT] 봇이 시작되었습니다...")
             print(
