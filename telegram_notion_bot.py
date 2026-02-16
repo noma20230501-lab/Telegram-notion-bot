@@ -1286,7 +1286,8 @@ class TelegramNotionBot:
         "📌 *명령어:*\n"
         "/start \\- 봇 시작\n"
         "/help \\- 도움말 보기\n"
-        "/check \\- 매물 동기화 상태 확인\n"
+        "/check \\- 매물 동기화 상태 확인 \\(간단\\)\n"
+        "/매물확인 \\- 텔레그램↔노션 전체 매물 비교\n"
         "/동기화 \\- 삭제된 매물 노션 정리 \\(수동\\)\n"
         "/delete \\- 매물 개별 삭제 \\(답장으로 사용\\)"
     )
@@ -1769,10 +1770,130 @@ class TelegramNotionBot:
                 self.HELP_TEXT, parse_mode="MarkdownV2"
             )
 
+    async def property_check_command(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ):
+        """/매물확인 명령어: 텔레그램 vs 노션 매물 차이 확인"""
+        message = update.effective_message
+        if not message:
+            return
+
+        try:
+            status_msg = await message.reply_text(
+                "🔍 매물 확인 중...\n"
+                "텔레그램과 노션을 비교합니다..."
+            )
+
+            # ── 1단계: 노션에서 추적 중인 모든 매물 조회 ──
+            tracked_pages = self.notion_uploader.get_tracked_pages()
+            notion_map = {}  # {msg_id: {"page_id": ..., "title": ...}}
+            for page in tracked_pages:
+                notion_map[page["msg_id"]] = {
+                    "page_id": page["page_id"],
+                    "title": page["title"],
+                    "chat_id": page["chat_id"],
+                }
+
+            # ── 2단계: 메모리 매핑 추가 (봇이 업로드한 매물) ──
+            all_msg_ids = set(notion_map.keys()) | set(self._page_mapping.keys())
+
+            telegram_exists = {}  # {msg_id: bool}
+            notion_only = []  # [(title, page_id)]
+            telegram_only = []  # [(msg_id, title)]
+
+            # ── 3단계: 각 메시지 존재 여부 확인 ──
+            checked = 0
+            for msg_id in all_msg_ids:
+                checked += 1
+                
+                # chat_id 찾기
+                chat_id = None
+                if msg_id in notion_map:
+                    chat_id = notion_map[msg_id]["chat_id"]
+                elif msg_id in self._msg_chat_ids:
+                    chat_id = self._msg_chat_ids[msg_id]
+                else:
+                    chat_id = message.chat_id  # 기본값
+
+                # 텔레그램 메시지 존재 확인
+                exists = await self._check_message_exists(
+                    context.bot, chat_id, msg_id
+                )
+                telegram_exists[msg_id] = exists
+
+                # API 속도 제한 방지
+                await asyncio.sleep(0.05)
+
+                # 진행 상황 업데이트 (50개마다)
+                if checked % 50 == 0:
+                    await status_msg.edit_text(
+                        f"🔍 매물 확인 중... {checked}/{len(all_msg_ids)}"
+                    )
+
+            # ── 4단계: 차이점 분석 ──
+            for msg_id in all_msg_ids:
+                exists = telegram_exists.get(msg_id, False)
+                in_notion = msg_id in notion_map
+                in_memory = msg_id in self._page_mapping
+
+                if not exists and in_notion:
+                    # 텔레그램에 없는데 노션에 있음 → 노션에만 있음
+                    notion_only.append(
+                        (notion_map[msg_id]["title"], notion_map[msg_id]["page_id"])
+                    )
+                elif exists and not in_notion and not in_memory:
+                    # 텔레그램에 있는데 노션/메모리에 없음 → 텔레그램에만 있음
+                    telegram_only.append((msg_id, f"msg_{msg_id}"))
+
+            # ── 5단계: 결과 메시지 생성 ──
+            telegram_count = sum(1 for exists in telegram_exists.values() if exists)
+            notion_count = len(notion_map) + len(
+                [m for m in self._page_mapping if m not in notion_map]
+            )
+
+            result = "📊 매물 확인 결과\n"
+            result += "━━━━━━━━━━━━━━━━\n"
+            result += f"📱 텔레그램 매물: {telegram_count}개\n"
+            result += f"📝 노션 매물: {notion_count}개\n\n"
+
+            if notion_only:
+                result += f"❌ 노션에만 있는 매물: {len(notion_only)}개\n"
+                result += "(텔레그램에서 삭제됨)\n"
+                result += "━━━━━━━━━━━━━━━━\n\n"
+                for title, page_id in notion_only[:10]:
+                    result += f"{title}\n"
+                if len(notion_only) > 10:
+                    result += f"... (외 {len(notion_only) - 10}개)\n"
+                result += "\n💡 조치 방법:\n"
+                result += "→ /동기화 실행하면 노션에서 자동 삭제됩니다.\n\n"
+
+            if telegram_only:
+                result += f"❌ 텔레그램에만 있는 매물: {len(telegram_only)}개\n"
+                result += "(노션에 등록 안됨)\n"
+                result += "━━━━━━━━━━━━━━━━\n\n"
+                for msg_id, title in telegram_only[:10]:
+                    result += f"{title} (msg_id: {msg_id})\n"
+                if len(telegram_only) > 10:
+                    result += f"... (외 {len(telegram_only) - 10}개)\n"
+                result += "\n💡 조치 방법:\n"
+                result += "1. 노션 휴지통에서 복원\n"
+                result += "2. 또는 텔레그램에서 해당 메시지 수정\n"
+                result += "   (아무 글자 추가/삭제하면 봇이 자동 재등록)\n\n"
+
+            if not notion_only and not telegram_only:
+                result += "✅ 완벽하게 동기화되어 있습니다!\n"
+                result += "텔레그램과 노션의 매물이 일치합니다.\n"
+
+            await status_msg.edit_text(result)
+
+        except Exception as e:
+            logger.error(f"/매물확인 오류: {e}", exc_info=True)
+            await message.reply_text(f"❌ 확인 중 오류 발생: {str(e)}")
+
     async def check_command(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ):
-        """텔레그램 매물과 노션 매물 동기화 체크"""
+        """텔레그램 매물과 노션 매물 동기화 체크 (기존 간단 버전)"""
         message = update.effective_message
         if not message:
             return
@@ -2558,6 +2679,16 @@ class TelegramNotionBot:
                 self.sync_command,
             )
         )
+        application.add_handler(
+            MessageHandler(
+                filters.Regex(r"^/매물확인")
+                & (
+                    filters.UpdateType.MESSAGE
+                    | filters.UpdateType.CHANNEL_POST
+                ),
+                self.property_check_command,
+            )
+        )
 
         # 명령어 핸들러 (채널 포스트)
         application.add_handler(
@@ -2586,6 +2717,13 @@ class TelegramNotionBot:
                 filters.Regex(r"^/delete")
                 & filters.UpdateType.CHANNEL_POST,
                 self.delete_command,
+            )
+        )
+        application.add_handler(
+            MessageHandler(
+                filters.Regex(r"^/매물확인")
+                & filters.UpdateType.CHANNEL_POST,
+                self.property_check_command,
             )
         )
 
