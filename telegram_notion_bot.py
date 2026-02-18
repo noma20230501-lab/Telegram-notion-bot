@@ -1253,6 +1253,10 @@ class TelegramNotionBot:
 
     # 앨범 사진 수집 대기 시간 (초)
     MEDIA_GROUP_TIMEOUT = 2.0
+    # 복수 미디어그룹 수집 시간창 (초) - 이 시간 이내 사진들을 같은 매물로 묶음
+    PROPERTY_COLLECT_WINDOW = 120
+    # 저장 대기 버퍼 (초) - 매물 설명 감지 후 이 시간 후에 저장 (실수 삭제 방지)
+    PROPERTY_SAVE_BUFFER = 30
 
     HELP_TEXT = (
         "🏠 *부동산 매물 등록 봇*\n\n"
@@ -1313,6 +1317,12 @@ class TelegramNotionBot:
         self._msg_chat_ids: Dict[int, int] = {}
         # 동기화 중 플래그 (전달 메시지 무시용)
         self._sync_in_progress = False
+        # 채팅별 사진 수집 버퍼 (복수 미디어그룹 + 분리 텍스트 묶음 처리)
+        self._chat_buffers: Dict[int, Dict] = {}
+        # 30초 저장 대기 태스크 (실수 삭제 방지 버퍼)
+        self._save_tasks: Dict[int, asyncio.Task] = {}
+        # 2분 버퍼 만료 태스크
+        self._collect_tasks: Dict[int, asyncio.Task] = {}
 
         # 매물접수자 이름 목록 (노션 셀렉트 옵션과 일치해야 함)
         self._staff_names = [
@@ -1528,6 +1538,116 @@ class TelegramNotionBot:
                 changes.append("특이사항수정")
         
         return ", ".join(changes) if changes else "내용수정"
+
+    # ──────────────────────────────────────────────
+    # 채팅 버퍼 & 저장 버퍼 관리
+    # (복수 미디어그룹 + 사진/텍스트 분리 업로드 지원)
+    # ──────────────────────────────────────────────
+
+    def _get_or_create_buffer(self, chat_id: int) -> Dict:
+        """채팅별 사진 버퍼 가져오기 (없으면 생성)"""
+        if chat_id not in self._chat_buffers:
+            self._chat_buffers[chat_id] = {
+                "photos": [],
+                "first_message": None,
+                "author_signature": None,
+            }
+        return self._chat_buffers[chat_id]
+
+    def _add_photos_to_buffer(
+        self,
+        chat_id: int,
+        photos: List[str],
+        message,
+        author_sig: str = None,
+    ):
+        """채팅 버퍼에 사진 추가 + 2분 만료 타이머 리셋"""
+        buf = self._get_or_create_buffer(chat_id)
+        buf["photos"].extend(photos)
+        if buf["first_message"] is None:
+            buf["first_message"] = message
+        if author_sig and not buf["author_signature"]:
+            buf["author_signature"] = author_sig
+        # 기존 만료 태스크 취소 후 재시작
+        existing = self._collect_tasks.get(chat_id)
+        if existing:
+            existing.cancel()
+        self._collect_tasks[chat_id] = asyncio.create_task(
+            self._expire_chat_buffer(chat_id)
+        )
+
+    async def _expire_chat_buffer(self, chat_id: int):
+        """2분 후 채팅 버퍼 자동 만료 (매물 설명 없으면 사진 폐기)"""
+        await asyncio.sleep(self.PROPERTY_COLLECT_WINDOW)
+        self._chat_buffers.pop(chat_id, None)
+        self._collect_tasks.pop(chat_id, None)
+        logger.debug(f"채팅 버퍼 만료: chat_id={chat_id}")
+
+    def _clear_chat_buffer(self, chat_id: int):
+        """채팅 버퍼 즉시 정리"""
+        self._chat_buffers.pop(chat_id, None)
+        task = self._collect_tasks.pop(chat_id, None)
+        if task:
+            task.cancel()
+
+    async def _schedule_property_save(
+        self,
+        chat_id: int,
+        description: str,
+        trigger_message,
+        context,
+    ):
+        """30초 후 매물 저장 예약 (실수 삭제 방지 버퍼)"""
+        # 기존 저장 태스크 취소 (같은 채팅에서 새 매물 설명이 오면 덮어쓰기)
+        existing = self._save_tasks.get(chat_id)
+        if existing:
+            existing.cancel()
+        self._save_tasks[chat_id] = asyncio.create_task(
+            self._do_save_with_buffer(
+                chat_id, description, trigger_message, context.bot
+            )
+        )
+        logger.debug(
+            f"매물 저장 예약: chat_id={chat_id}, "
+            f"{self.PROPERTY_SAVE_BUFFER}초 후 실행"
+        )
+
+    async def _do_save_with_buffer(
+        self,
+        chat_id: int,
+        description: str,
+        trigger_message,
+        bot,
+    ):
+        """30초 대기 → 트리거 메시지 존재 확인 → 저장 실행"""
+        await asyncio.sleep(self.PROPERTY_SAVE_BUFFER)
+        self._save_tasks.pop(chat_id, None)
+
+        # 트리거 메시지(매물 설명) 존재 확인 (30초 이내 삭제 시 저장 취소)
+        exists = await self._check_message_exists(
+            bot, trigger_message.chat_id, trigger_message.message_id
+        )
+        if not exists:
+            logger.info(
+                f"트리거 메시지 삭제됨, 저장 취소: chat_id={chat_id}"
+            )
+            self._clear_chat_buffer(chat_id)
+            return
+
+        # 버퍼에서 사진 가져오기
+        buf = self._chat_buffers.get(chat_id, {})
+        photo_urls = list(buf.get("photos", []))
+        author_sig = buf.get("author_signature") or getattr(
+            trigger_message, "author_signature", None
+        )
+
+        # 버퍼 정리 (중복 저장 방지)
+        self._clear_chat_buffer(chat_id)
+
+        # 매물 저장 실행
+        await self._save_property_to_notion(
+            description, trigger_message, photo_urls, author_sig
+        )
 
     # ──────────────────────────────────────────────
     # 답장(Reply) 기반 매물 수정 기능
@@ -2075,6 +2195,88 @@ class TelegramNotionBot:
             )
 
     # ──────────────────────────────────────────────
+    # 매물 노션 저장 (공통 로직)
+    # ──────────────────────────────────────────────
+
+    async def _save_property_to_notion(
+        self,
+        description: str,
+        trigger_message,
+        photo_urls: List[str],
+        author_sig: str = None,
+    ):
+        """매물 정보를 노션에 저장하고 원본 메시지에 노션 링크 추가
+
+        Args:
+            description: 매물 설명 텍스트
+            trigger_message: 노션 링크를 추가할 기준 메시지
+                             (캡션 있으면 caption 수정, 없으면 text 수정)
+            photo_urls: 사진 URL 목록 (없으면 빈 리스트)
+            author_sig: 작성자 서명 (author_signature)
+        """
+        try:
+            property_data = self.parser.parse_property_info(description)
+            property_data["원본 메시지"] = description
+            property_data["telegram_chat_id"] = trigger_message.chat_id
+            property_data["telegram_msg_id"] = trigger_message.message_id
+
+            # 채널 서명에서 매물접수자 추출
+            sig = author_sig or getattr(
+                trigger_message, "author_signature", None
+            )
+            staff = self._match_staff_name(sig)
+            if staff:
+                property_data["매물접수"] = staff
+
+            # 노션 업로드
+            page_url, page_id = self.notion_uploader.upload_property(
+                property_data,
+                photo_urls if photo_urls else None,
+            )
+
+            # 매핑 저장
+            self._page_mapping[trigger_message.message_id] = page_id
+            self._original_texts[trigger_message.message_id] = description
+            self._msg_chat_ids[trigger_message.message_id] = (
+                trigger_message.chat_id
+            )
+
+            # 원본 메시지에 노션 링크 추가
+            notion_html = self._build_notion_section(
+                page_url, page_id, use_html=True
+            )
+            notion_plain = self._build_notion_section(
+                page_url, page_id, use_html=False
+            )
+            is_caption = trigger_message.caption is not None
+            success = await self._safe_edit_message(
+                trigger_message,
+                description,
+                notion_html,
+                notion_plain,
+                is_caption=is_caption,
+            )
+            if not success:
+                try:
+                    await trigger_message.reply_text(
+                        f"✅ 노션 등록완료\n🔗 {page_url}"
+                    )
+                except Exception:
+                    pass
+
+            logger.info(
+                f"매물 저장 완료: {property_data.get('주소', '?')}, "
+                f"사진 {len(photo_urls)}장"
+            )
+
+        except Exception as e:
+            logger.error(f"매물 저장 오류: {e}", exc_info=True)
+            try:
+                await trigger_message.reply_text(f"❌ 오류 발생: {str(e)}")
+            except Exception:
+                pass
+
+    # ──────────────────────────────────────────────
     # 사진 메시지 처리
     # ──────────────────────────────────────────────
 
@@ -2099,81 +2301,27 @@ class TelegramNotionBot:
             # ── 단일 사진 처리 ──
             caption = message.caption
 
-            # 캡션이 없거나 매물 형식(1. 2. 3...)이 아니면 무시
-            if not self._is_listing_format(caption):
-                return
-
+            # 사진 URL 가져오기
             try:
-                property_data = self.parser.parse_property_info(
-                    caption
-                )
-                property_data["원본 메시지"] = caption
-
-                # 텔레그램 동기화 정보 저장
-                property_data["telegram_chat_id"] = message.chat_id
-                property_data["telegram_msg_id"] = (
-                    message.message_id
-                )
-
-                # 채널 서명에서 매물접수자 자동 추출
-                staff = self._match_staff_name(
-                    message.author_signature
-                )
-                if staff:
-                    property_data["매물접수"] = staff
-
                 photo = message.photo[-1]
                 photo_file = await photo.get_file()
                 photo_url = photo_file.file_path
-
-                loading_msg = await message.reply_text(
-                    "⏳ 노션에 등록 중..."
-                )
-                page_url, page_id = (
-                    self.notion_uploader.upload_property(
-                        property_data, [photo_url]
-                    )
-                )
-
-                # 매핑 먼저 저장 (수정 이벤트보다 먼저)
-                self._page_mapping[message.message_id] = page_id
-                self._original_texts[message.message_id] = caption
-                self._msg_chat_ids[message.message_id] = (
-                    message.chat_id
-                )
-
-                # 원본 캡션에 노션 정보 추가
-                notion_html = self._build_notion_section(
-                    page_url, page_id, use_html=True
-                )
-                notion_plain = self._build_notion_section(
-                    page_url, page_id, use_html=False
-                )
-
-                success = await self._safe_edit_message(
-                    message, caption,
-                    notion_html, notion_plain,
-                    is_caption=True,
-                )
-                if not success:
-                    await message.reply_text(
-                        f"✅ 노션 등록완료\n"
-                        f"🔗 {page_url}"
-                    )
-
-                # ⏳ 중간 메시지 삭제
-                try:
-                    await loading_msg.delete()
-                except Exception:
-                    pass
-
             except Exception as e:
-                logger.error(
-                    f"단일 사진 처리 오류: {e}", exc_info=True
+                logger.error(f"사진 URL 가져오기 실패: {e}")
+                return
+
+            # 채팅 버퍼에 사진 추가
+            self._add_photos_to_buffer(
+                message.chat_id, [photo_url], message,
+                message.author_signature,
+            )
+
+            # 캡션이 매물 형식이면 → 30초 후 저장 예약
+            if caption and self._is_listing_format(caption):
+                await self._schedule_property_save(
+                    message.chat_id, caption, message, context
                 )
-                await message.reply_text(
-                    f"❌ 오류 발생: {str(e)}"
-                )
+            # 캡션 없거나 매물 형식 아니면 → 사진만 버퍼에 보관
 
     async def _collect_media_group(self, message, context):
         """앨범 사진을 수집하고, 타임아웃 후 일괄 처리"""
@@ -2186,6 +2334,7 @@ class TelegramNotionBot:
                 "caption": None,
                 "message": message,
                 "author_signature": message.author_signature,
+                "context": context,  # 30초 저장 버퍼에서 사용
             }
 
         # 사진 추가 (가장 큰 해상도)
@@ -2218,83 +2367,30 @@ class TelegramNotionBot:
         await self._process_media_group(media_group_id)
 
     async def _process_media_group(self, media_group_id):
-        """수집된 앨범 사진을 일괄 처리하여 노션에 업로드"""
+        """수집된 앨범 사진을 채팅 버퍼에 추가하고, 캡션이 매물 설명이면 저장 예약"""
         task_key = f"media_group_{media_group_id}"
         self._pending_tasks.pop(task_key, None)
 
         group_data = self._media_groups.pop(media_group_id, None)
-
         if not group_data:
             return
 
         message = group_data["message"]
         caption = group_data["caption"]
         photo_urls = group_data["photos"]
+        context = group_data.get("context")
+        author_sig = group_data.get("author_signature")
+        chat_id = message.chat_id
 
-        # 캡션이 없거나 매물 형식(1. 2. 3...)이 아니면 무시
-        if not self._is_listing_format(caption):
-            return
+        # 사진을 채팅 버퍼에 추가 (복수 미디어그룹 묶음 처리)
+        self._add_photos_to_buffer(chat_id, photo_urls, message, author_sig)
 
-        try:
-            property_data = self.parser.parse_property_info(caption)
-            property_data["원본 메시지"] = caption
-
-            # 텔레그램 동기화 정보 저장
-            property_data["telegram_chat_id"] = message.chat_id
-            property_data["telegram_msg_id"] = (
-                message.message_id
+        # 캡션이 매물 형식(1. 2. 3...)이면 → 30초 후 저장 예약
+        if caption and self._is_listing_format(caption) and context:
+            await self._schedule_property_save(
+                chat_id, caption, message, context
             )
-
-            # 채널 서명에서 매물접수자 자동 추출
-            author_sig = group_data.get("author_signature")
-            staff = self._match_staff_name(author_sig)
-            if staff:
-                property_data["매물접수"] = staff
-
-            loading_msg = await message.reply_text(
-                f"⏳ 노션에 등록 중... (사진 {len(photo_urls)}장)"
-            )
-            page_url, page_id = (
-                self.notion_uploader.upload_property(
-                    property_data, photo_urls
-                )
-            )
-
-            # 매핑 먼저 저장 (수정 이벤트보다 먼저)
-            self._page_mapping[message.message_id] = page_id
-            self._original_texts[message.message_id] = caption
-            self._msg_chat_ids[message.message_id] = (
-                message.chat_id
-            )
-
-            # 원본 캡션에 노션 정보 추가
-            notion_html = self._build_notion_section(
-                page_url, page_id, use_html=True
-            )
-            notion_plain = self._build_notion_section(
-                page_url, page_id, use_html=False
-            )
-
-            success = await self._safe_edit_message(
-                message, caption,
-                notion_html, notion_plain,
-                is_caption=True,
-            )
-            if not success:
-                await message.reply_text(
-                    f"✅ 노션 등록완료\n"
-                    f"🔗 {page_url}"
-                )
-
-            # ⏳ 중간 메시지 삭제
-            try:
-                await loading_msg.delete()
-            except Exception:
-                pass
-
-        except Exception as e:
-            logger.error(f"앨범 처리 오류: {e}", exc_info=True)
-            await message.reply_text(f"❌ 오류 발생: {str(e)}")
+        # 캡션 없거나 매물 형식 아니면 → 사진만 버퍼에 보관, 텍스트 대기
 
     # ──────────────────────────────────────────────
     # 텔레그램 ↔ 노션 동기화 (삭제 감지)
@@ -2570,70 +2666,37 @@ class TelegramNotionBot:
             return
 
         text = message.text or message.caption
-
-        # 매물 형식(1. 2. 3...)이 아니면 조용히 무시
-        if not self._is_listing_format(text):
+        if not text:
             return
 
-        try:
-            property_data = self.parser.parse_property_info(text)
-            property_data["원본 메시지"] = text
-
-            # 텔레그램 동기화 정보 저장
-            property_data["telegram_chat_id"] = message.chat_id
-            property_data["telegram_msg_id"] = message.message_id
-
-            # 채널 서명에서 매물접수자 자동 추출
-            staff = self._match_staff_name(
-                message.author_signature
+        # ── 매물 설명인지 확인 (1. 2. 3... 번호 형식) ──
+        if self._is_listing_format(text):
+            # 채팅 버퍼의 사진들과 함께 30초 후 저장 예약
+            await self._schedule_property_save(
+                message.chat_id, text, message, context
             )
-            if staff:
-                property_data["매물접수"] = staff
+            return
 
-            loading_msg = await message.reply_text(
-                "⏳ 노션에 등록 중..."
+        # ── 층수 라벨인지 확인 (20자 이하 짧은 텍스트) ──
+        # 채팅 버퍼에 사진이 있을 때만 버퍼 만료 타이머 리셋
+        text_stripped = text.strip()
+        if (
+            len(text_stripped) <= 20
+            and message.chat_id in self._chat_buffers
+            and not text_stripped.startswith("/")
+        ):
+            # 층수 라벨로 인식 ("1층", "2층", "B1층" 등)
+            # 버퍼 만료 타이머 리셋 (2분 연장)
+            existing = self._collect_tasks.get(message.chat_id)
+            if existing:
+                existing.cancel()
+            self._collect_tasks[message.chat_id] = asyncio.create_task(
+                self._expire_chat_buffer(message.chat_id)
             )
-            page_url, page_id = (
-                self.notion_uploader.upload_property(property_data)
+            logger.debug(
+                f"층수 라벨 인식: '{text_stripped}', "
+                f"버퍼 타이머 리셋 (chat_id={message.chat_id})"
             )
-
-            # 매핑 먼저 저장 (수정 이벤트보다 먼저)
-            self._page_mapping[message.message_id] = page_id
-            self._original_texts[message.message_id] = text
-            self._msg_chat_ids[message.message_id] = (
-                message.chat_id
-            )
-
-            # 원본 텍스트에 노션 정보 추가
-            notion_html = self._build_notion_section(
-                page_url, page_id, use_html=True
-            )
-            notion_plain = self._build_notion_section(
-                page_url, page_id, use_html=False
-            )
-
-            success = await self._safe_edit_message(
-                message, text,
-                notion_html, notion_plain,
-                is_caption=False,
-            )
-            if not success:
-                await message.reply_text(
-                    f"✅ 노션 등록완료\n"
-                    f"🔗 {page_url}"
-                )
-
-            # ⏳ 중간 메시지 삭제
-            try:
-                await loading_msg.delete()
-            except Exception:
-                pass
-
-        except Exception as e:
-            logger.error(
-                f"텍스트 메시지 처리 오류: {e}", exc_info=True
-            )
-            await message.reply_text(f"❌ 오류 발생: {str(e)}")
 
     # ──────────────────────────────────────────────
     # 봇 실행
