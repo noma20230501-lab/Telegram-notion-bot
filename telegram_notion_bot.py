@@ -50,6 +50,8 @@ class PropertyParser:
             skip_address: True이면 첫 줄을 주소로 처리하지 않음 (수정 모드)
         """
 
+        # 4번 섹션 다중 줄 처리 (층별 면적/용도가 다음 줄에 이어지는 경우 합치기)
+        text = PropertyParser._merge_section4_lines(text.strip())
         lines = text.strip().split("\n")
         data = {}
 
@@ -308,17 +310,43 @@ class PropertyParser:
                     if 전용_match:
                         data["전용면적"] = float(전용_match.group(1))
 
-                # 건축물용도: "계약(면적)" 또는 "전용(면적)" 앞의 텍스트 추출
-                용도_text = re.split(
-                    r'\s*/\s*계약(?:면적)?|\s+계약(?:면적)?'
-                    r'|\s*/\s*전용(?:면적)?|\s+전용(?:면적)?'
-                    r'|\s*\d+층',
-                    content4,
-                )[0].strip().rstrip(' /')
-                if 용도_text:
-                    data["건축물용도"] = (
-                        PropertyParser._normalize_building_use(용도_text)
-                    )
+                # ── 건축물용도 파싱 (층별 다용도 지원) ──
+                floor_use_pairs = PropertyParser._parse_floor_uses(content4)
+
+                if len(floor_use_pairs) > 1:
+                    # 복층/통상가: 층별 용도가 서로 다름
+                    # 중복 제거 (순서 유지)
+                    seen_uses: List[str] = []
+                    seen_set: set = set()
+                    for _, use in floor_use_pairs:
+                        if use not in seen_set:
+                            seen_uses.append(use)
+                            seen_set.add(use)
+                    data["건축물용도"] = seen_uses  # 리스트 → multi_select
+
+                    # 층별용도 문자열 생성: "1층 제1종 / 2,3층 제2종"
+                    abbr_parts = []
+                    for fl, use in floor_use_pairs:
+                        abbr = PropertyParser._abbreviate_building_use(use)
+                        abbr_parts.append(f"{fl}층 {abbr}")
+                    data["층별용도"] = " / ".join(abbr_parts)
+
+                elif len(floor_use_pairs) == 1:
+                    # 단일 층 용도 명시
+                    data["건축물용도"] = [floor_use_pairs[0][1]]
+
+                else:
+                    # 층 구분 없음 → 기존 방식: 앞부분에서 용도 추출
+                    용도_text = re.split(
+                        r'\s*/\s*계약(?:면적)?|\s+계약(?:면적)?'
+                        r'|\s*/\s*전용(?:면적)?|\s+전용(?:면적)?'
+                        r'|\s*\d+층',
+                        content4,
+                    )[0].strip().rstrip(' /')
+                    if 용도_text:
+                        data["건축물용도"] = [
+                            PropertyParser._normalize_building_use(용도_text)
+                        ]
 
             # 5. 주차 / 화장실
             elif line.startswith("5."):
@@ -538,13 +566,156 @@ class PropertyParser:
 
     @staticmethod
     def _normalize_building_use(text: str) -> str:
-        """건축물용도 약어를 정식 명칭으로 정규화"""
+        """건축물용도 약어를 정식 명칭으로 정규화
+        
+        다양한 표기법 지원:
+        1종, 제1종, 1종근생, 1종근린, 근생1종, 제1종근린생활시설 등
+        """
         text = text.strip()
-        if re.search(r'(제\s*)?1\s*종', text):
+        # 1종 근린생활시설 계열 (다양한 약어 포함)
+        if re.search(
+            r'(?:제\s*)?1\s*종'
+            r'|1\s*종\s*근\s*(?:린\s*)?(?:생)?'
+            r'|근\s*생\s*1\s*종'
+            r'|근\s*린\s*1\s*종',
+            text
+        ):
             return "제1종근린생활시설"
-        if re.search(r'(제\s*)?2\s*종', text):
+        # 2종 근린생활시설 계열
+        if re.search(
+            r'(?:제\s*)?2\s*종'
+            r'|2\s*종\s*근\s*(?:린\s*)?(?:생)?'
+            r'|근\s*생\s*2\s*종'
+            r'|근\s*린\s*2\s*종',
+            text
+        ):
             return "제2종근린생활시설"
+        if re.search(r'판\s*매\s*시\s*설', text):
+            return "판매시설"
+        if re.search(r'위\s*락\s*시\s*설', text):
+            return "위락시설"
+        if re.search(r'숙\s*박\s*시\s*설', text):
+            return "숙박시설"
+        if re.search(r'의\s*료\s*시\s*설', text):
+            return "의료시설"
+        if re.search(r'교\s*육\s*(?:연\s*구\s*)?시\s*설', text):
+            return "교육연구시설"
+        if re.search(r'업\s*무\s*시\s*설', text):
+            return "업무시설"
+        if re.search(r'수\s*련\s*시\s*설', text):
+            return "수련시설"
+        if re.search(r'공\s*장', text):
+            return "공장"
+        if re.search(r'창\s*고', text):
+            return "창고시설"
         return text
+
+    @staticmethod
+    def _abbreviate_building_use(full_use: str) -> str:
+        """노션 층별용도 표시용 약칭 변환 (짧게)"""
+        return {
+            "제1종근린생활시설": "제1종",
+            "제2종근린생활시설": "제2종",
+            "판매시설": "판매",
+            "위락시설": "위락",
+            "숙박시설": "숙박",
+            "의료시설": "의료",
+            "교육연구시설": "교육",
+            "업무시설": "업무",
+            "수련시설": "수련",
+            "공장": "공장",
+            "창고시설": "창고",
+        }.get(full_use, full_use)
+
+    @staticmethod
+    def _parse_floor_uses(text: str) -> List[Tuple[str, str]]:
+        """층별 건축물 용도 파싱
+
+        "1층 1종근생 2,3층 2종근생" →
+            [("1", "제1종근린생활시설"), ("2,3", "제2종근린생활시설")]
+
+        Args:
+            text: 4번 섹션 원본 텍스트
+
+        Returns:
+            [(floor_key, normalized_use), ...] 순서 유지
+        """
+        # 면적 패턴(숫자/숫자) 제거 → 용도만 남김
+        cleaned = re.sub(r'\d+\.?\d*\s*/\s*\d+\.?\d*', '', text)
+        # 괄호 안 평수 정보 제거
+        cleaned = re.sub(r'\([^)]*\)', '', cleaned)
+        # 면적 단위 텍스트 제거 (계약 144m2, 전용 33m2 등)
+        cleaned = re.sub(
+            r'(?:계(?:약)?|전(?:용)?)\s*\d+\.?\d*\s*(?:m2|㎡)',
+            '', cleaned
+        )
+        cleaned = cleaned.strip()
+
+        # 층 마커 위치 탐색 (예: 1층, 2층, 2,3층, 1~3층)
+        floor_markers = list(
+            re.finditer(r'(\d+(?:[,~\-]\d+)*)\s*층', cleaned)
+        )
+        if not floor_markers:
+            return []
+
+        results = []
+        for i, marker in enumerate(floor_markers):
+            floor_key = marker.group(1)
+            # 용도 텍스트: 이 층 마커 끝 ~ 다음 층 마커 시작
+            start = marker.end()
+            end = (
+                floor_markers[i + 1].start()
+                if i + 1 < len(floor_markers)
+                else len(cleaned)
+            )
+            use_text = cleaned[start:end].strip()
+            # 불필요한 앞뒤 문자 제거
+            use_text = re.sub(r'^[\s,]+|[\s,]+$', '', use_text)
+            if use_text:
+                normalized = PropertyParser._normalize_building_use(
+                    use_text
+                )
+                results.append((floor_key, normalized))
+
+        return results
+
+    @staticmethod
+    def _merge_section4_lines(text: str) -> str:
+        """4번 섹션의 연속 줄(다층 면적/용도)을 한 줄로 합치기
+
+        예:
+          4. 1층 1종근생 2,3층 2종근생
+             1층 40/40 2층 50/50 3층 30/30
+          →
+          4. 1층 1종근생 2,3층 2종근생 1층 40/40 2층 50/50 3층 30/30
+        """
+        lines = text.split('\n')
+        result = []
+        in_section4 = False
+
+        for line in lines:
+            stripped = line.strip()
+            is_numbered = bool(re.match(r'^\d+\.', stripped))
+
+            if stripped.startswith('4.'):
+                in_section4 = True
+                result.append(stripped)
+            elif in_section4 and not is_numbered and stripped:
+                # 층/면적 패턴이 있으면 앞 줄에 이어 붙임
+                looks_like_continuation = bool(
+                    re.search(r'\d+층|\d+\.?\d*/\d+', stripped)
+                )
+                if looks_like_continuation and result:
+                    result[-1] = result[-1] + ' ' + stripped
+                else:
+                    in_section4 = False
+                    result.append(line)
+            else:
+                if is_numbered:
+                    in_section4 = False
+                result.append(line)
+
+        return '\n'.join(result)
 
 
 class NotionUploader:
@@ -562,6 +733,8 @@ class NotionUploader:
                 properties={
                     "telegram_chat_id": {"number": {}},
                     "telegram_msg_id": {"number": {}},
+                    # 층별 용도 상세 필드 (신규)
+                    "층별용도": {"rich_text": {}},
                 },
             )
             logger.info("동기화용 Notion 속성 확인 완료")
@@ -663,12 +836,33 @@ class NotionUploader:
                 ]
             }
 
-        # ── 🏢건축물용도 (select) ──
+        # ── 🏢건축물용도 (multi_select) ──
+        # property_data["건축물용도"]는 리스트 (예: ["제1종근린생활시설", "제2종근린생활시설"])
         if "건축물용도" in property_data:
+            용도_value = property_data["건축물용도"]
+            if isinstance(용도_value, list):
+                용도_list = 용도_value
+            else:
+                # 이전 버전 호환: 문자열로 저장된 경우
+                용도_list = [용도_value]
             properties["🏢건축물용도"] = {
-                "select": {
-                    "name": property_data["건축물용도"][:100]
-                }
+                "multi_select": [
+                    {"name": use[:100]}
+                    for use in 용도_list
+                    if use
+                ]
+            }
+
+        # ── 층별용도 (rich_text) - 복층/통상가 전용 ──
+        if "층별용도" in property_data:
+            properties["층별용도"] = {
+                "rich_text": [
+                    {
+                        "text": {
+                            "content": property_data["층별용도"][:2000]
+                        }
+                    }
+                ]
             }
 
         # ── 🏢 매물 유형 (select) ──
@@ -858,13 +1052,88 @@ class NotionUploader:
 
         return properties
 
+    @staticmethod
+    def _build_photo_blocks(photo_urls: List[str]) -> List[Dict]:
+        """사진 URL 목록을 노션 블록 목록으로 변환 (2열 레이아웃)"""
+        blocks = []
+        for i in range(0, len(photo_urls), 2):
+            pair = photo_urls[i: i + 2]
+            if len(pair) == 2:
+                blocks.append(
+                    {
+                        "object": "block",
+                        "type": "column_list",
+                        "column_list": {
+                            "children": [
+                                {
+                                    "object": "block",
+                                    "type": "column",
+                                    "column": {
+                                        "children": [
+                                            {
+                                                "object": "block",
+                                                "type": "image",
+                                                "image": {
+                                                    "type": "external",
+                                                    "external": {
+                                                        "url": pair[0]
+                                                    },
+                                                },
+                                            }
+                                        ]
+                                    },
+                                },
+                                {
+                                    "object": "block",
+                                    "type": "column",
+                                    "column": {
+                                        "children": [
+                                            {
+                                                "object": "block",
+                                                "type": "image",
+                                                "image": {
+                                                    "type": "external",
+                                                    "external": {
+                                                        "url": pair[1]
+                                                    },
+                                                },
+                                            }
+                                        ]
+                                    },
+                                },
+                            ]
+                        },
+                    }
+                )
+            else:
+                # 홀수 마지막 1장은 전체 너비
+                blocks.append(
+                    {
+                        "object": "block",
+                        "type": "image",
+                        "image": {
+                            "type": "external",
+                            "external": {"url": pair[0]},
+                        },
+                    }
+                )
+        return blocks
+
     def upload_property(
         self,
         property_data: Dict,
         photo_urls: Optional[List[str]] = None,
+        floor_photos: Optional[List[Dict]] = None,
     ) -> Tuple[str, str]:
         """
-        노션 데이터베이스에 매물 등록 (여러 장 사진 지원)
+        노션 데이터베이스에 매물 등록 (층별 사진 헤딩 지원)
+
+        Args:
+            property_data: 파싱된 매물 정보
+            photo_urls: flat 사진 URL 목록 (floor_photos 없을 때 사용)
+            floor_photos: 층별 사진 그룹
+                [{"label": "1층", "photos": [url, ...]}, ...]
+                라벨이 있으면 노션에 헤딩을 표시
 
         Returns:
             (page_url, page_id) 튜플
@@ -872,78 +1141,48 @@ class NotionUploader:
         properties = self._build_notion_properties(property_data)
 
         # ──────────────────────────────────────────────
-        # 페이지 내용 (본문 블록) - 여러 장 사진 지원
+        # 페이지 내용 (본문 블록) - 층별 사진 헤딩 지원
         # ──────────────────────────────────────────────
         children = []
 
-        # 모든 사진 추가 (2열 컬럼 레이아웃)
-        if photo_urls:
-            for i in range(0, len(photo_urls), 2):
-                pair = photo_urls[i : i + 2]
-                if len(pair) == 2:
-                    # 2장을 나란히 배치
+        if floor_photos and any(
+            g.get("photos") for g in floor_photos
+        ):
+            # 층별 구분 사진 (헤딩 + 사진 그룹)
+            for group in floor_photos:
+                label = group.get("label")
+                photos = group.get("photos", [])
+                if not photos:
+                    continue
+
+                # 층 헤딩 추가 (라벨이 있을 때만)
+                if label:
                     children.append(
                         {
                             "object": "block",
-                            "type": "column_list",
-                            "column_list": {
-                                "children": [
+                            "type": "heading_2",
+                            "heading_2": {
+                                "rich_text": [
                                     {
-                                        "object": "block",
-                                        "type": "column",
-                                        "column": {
-                                            "children": [
-                                                {
-                                                    "object": "block",
-                                                    "type": "image",
-                                                    "image": {
-                                                        "type": "external",
-                                                        "external": {
-                                                            "url": pair[
-                                                                0
-                                                            ]
-                                                        },
-                                                    },
-                                                }
-                                            ]
-                                        },
-                                    },
-                                    {
-                                        "object": "block",
-                                        "type": "column",
-                                        "column": {
-                                            "children": [
-                                                {
-                                                    "object": "block",
-                                                    "type": "image",
-                                                    "image": {
-                                                        "type": "external",
-                                                        "external": {
-                                                            "url": pair[
-                                                                1
-                                                            ]
-                                                        },
-                                                    },
-                                                }
-                                            ]
-                                        },
-                                    },
+                                        "text": {
+                                            "content": f"📷 {label}"
+                                        }
+                                    }
                                 ]
                             },
                         }
                     )
-                else:
-                    # 홀수 마지막 1장은 전체 너비
-                    children.append(
-                        {
-                            "object": "block",
-                            "type": "image",
-                            "image": {
-                                "type": "external",
-                                "external": {"url": pair[0]},
-                            },
-                        }
-                    )
+
+                # 해당 층 사진 추가 (2열 레이아웃)
+                children.extend(
+                    self._build_photo_blocks(photos)
+                )
+
+        elif photo_urls:
+            # 층 구분 없는 flat 사진 목록
+            children.extend(
+                self._build_photo_blocks(photo_urls)
+            )
 
         # 특이사항 블록
         if "특이사항" in property_data:
@@ -1129,7 +1368,6 @@ class NotionUploader:
             # 선택 속성
             for key, notion_key in [
                 ("부가세", "🧾부가세 여부"),
-                ("건축물용도", "🏢건축물용도"),
                 ("주차", "🅿️주차"),
                 ("방향", "📍방향"),
                 ("화장실 위치", "🚻화장실 위치"),
@@ -1144,6 +1382,16 @@ class NotionUploader:
                     sel = props[notion_key].get("select")
                     if sel:
                         result[key] = sel.get("name", "")
+
+            # 건축물용도 (multi_select) - 리스트로 반환
+            if "🏢건축물용도" in props:
+                ms = props["🏢건축물용도"].get("multi_select", [])
+                if ms:
+                    result["건축물용도"] = [
+                        item.get("name", "")
+                        for item in ms
+                        if item.get("name")
+                    ]
 
             # 텍스트 속성
             for key, notion_key in [
@@ -1508,18 +1756,24 @@ class TelegramNotionBot:
                 continue
             new_val = new_data[key]
             old_val = old_data.get(key)
-            
+
+            # 리스트(multi_select) 타입 처리 (건축물용도 등)
+            def _to_str(v):
+                if isinstance(v, list):
+                    return ", ".join(str(x) for x in v)
+                return str(v) if v is not None else ""
+
             # 숫자 비교
             if isinstance(old_val, (int, float)) and isinstance(new_val, (int, float)):
                 if old_val != new_val:
                     old_disp = int(old_val) if isinstance(old_val, float) and old_val == int(old_val) else old_val
                     changes.append(f"{label}{old_disp}→{new_val}")
             elif old_val is not None:
-                if str(old_val) != str(new_val):
-                    changes.append(f"{label}{old_val}→{new_val}")
+                if _to_str(old_val) != _to_str(new_val):
+                    changes.append(f"{label}{_to_str(old_val)}→{_to_str(new_val)}")
             else:
                 # 새로 추가
-                changes.append(f"{label}:{new_val}")
+                changes.append(f"{label}:{_to_str(new_val)}")
         
         # 거래 상태 체크 (특별 처리)
         if "거래_상태" in new_data:
@@ -1548,7 +1802,8 @@ class TelegramNotionBot:
         """채팅별 사진 버퍼 가져오기 (없으면 생성)"""
         if chat_id not in self._chat_buffers:
             self._chat_buffers[chat_id] = {
-                "photos": [],
+                # 층별 사진 그룹: [{"label": "1층"|None, "photos": [...]}]
+                "floor_groups": [{"label": None, "photos": []}],
                 "first_message": None,
                 "author_signature": None,
             }
@@ -1561,12 +1816,18 @@ class TelegramNotionBot:
         message,
         author_sig: str = None,
     ):
-        """채팅 버퍼에 사진 추가 + 2분 만료 타이머 리셋"""
+        """채팅 버퍼에 사진 추가 (현재 floor_group의 마지막 그룹에 추가) + 2분 만료 타이머 리셋"""
         buf = self._get_or_create_buffer(chat_id)
-        buf["photos"].extend(photos)
+
+        # floor_groups 마지막 그룹에 사진 추가
+        floor_groups = buf.setdefault(
+            "floor_groups", [{"label": None, "photos": []}]
+        )
+        floor_groups[-1]["photos"].extend(photos)
+
         if buf["first_message"] is None:
             buf["first_message"] = message
-        if author_sig and not buf["author_signature"]:
+        if author_sig and not buf.get("author_signature"):
             buf["author_signature"] = author_sig
         # 기존 만료 태스크 취소 후 재시작
         existing = self._collect_tasks.get(chat_id)
@@ -1574,6 +1835,42 @@ class TelegramNotionBot:
             existing.cancel()
         self._collect_tasks[chat_id] = asyncio.create_task(
             self._expire_chat_buffer(chat_id)
+        )
+
+    def _add_floor_label_to_buffer(self, chat_id: int, label: str):
+        """버퍼에 층수 라벨 추가 → 사진 그룹 구분
+
+        사진 뒤에 라벨이 오는 경우 (가장 일반적):
+            [사진 10장] → "1층" → [사진 12장] → "2층" → [매물설명]
+        사진 앞에 라벨이 오는 경우도 지원:
+            "1층" → [사진 10장] → "2층" → [사진 12장] → [매물설명]
+        """
+        buf = self._chat_buffers.get(chat_id)
+        if not buf:
+            return
+
+        floor_groups = buf.get(
+            "floor_groups", [{"label": None, "photos": []}]
+        )
+        if not floor_groups:
+            floor_groups = [{"label": None, "photos": []}]
+            buf["floor_groups"] = floor_groups
+
+        last_group = floor_groups[-1]
+
+        if last_group["photos"]:
+            # 사진이 먼저 왔음 → 현재 그룹에 라벨 붙이기
+            if last_group["label"] is None:
+                last_group["label"] = label
+            # 다음 사진을 위한 새 그룹 생성
+            floor_groups.append({"label": None, "photos": []})
+        else:
+            # 사진 없이 라벨만 왔음 → 이 라벨로 다음 사진 그룹 미리 지정
+            last_group["label"] = label
+
+        logger.debug(
+            f"층수 라벨 추가: '{label}', "
+            f"floor_groups={len(floor_groups)}개 (chat_id={chat_id})"
         )
 
     async def _expire_chat_buffer(self, chat_id: int):
@@ -1634,19 +1931,31 @@ class TelegramNotionBot:
             self._clear_chat_buffer(chat_id)
             return
 
-        # 버퍼에서 사진 가져오기
+        # 버퍼에서 사진 & 층별 그룹 가져오기
         buf = self._chat_buffers.get(chat_id, {})
-        photo_urls = list(buf.get("photos", []))
+        floor_groups = buf.get("floor_groups", [])
         author_sig = buf.get("author_signature") or getattr(
             trigger_message, "author_signature", None
         )
+
+        # 전체 사진 URL 목록 (flat)
+        photo_urls: List[str] = []
+        for g in floor_groups:
+            photo_urls.extend(g.get("photos", []))
+
+        # 층 구분 여부: 하나 이상의 그룹에 라벨이 있으면 floor_photos 전달
+        has_floor_structure = any(
+            g.get("label") for g in floor_groups
+        )
+        floor_photos_arg = floor_groups if has_floor_structure else None
 
         # 버퍼 정리 (중복 저장 방지)
         self._clear_chat_buffer(chat_id)
 
         # 매물 저장 실행
         await self._save_property_to_notion(
-            description, trigger_message, photo_urls, author_sig
+            description, trigger_message, photo_urls, author_sig,
+            floor_photos=floor_photos_arg,
         )
 
     # ──────────────────────────────────────────────
@@ -2204,15 +2513,17 @@ class TelegramNotionBot:
         trigger_message,
         photo_urls: List[str],
         author_sig: str = None,
+        floor_photos: Optional[List[Dict]] = None,
     ):
         """매물 정보를 노션에 저장하고 원본 메시지에 노션 링크 추가
 
         Args:
             description: 매물 설명 텍스트
             trigger_message: 노션 링크를 추가할 기준 메시지
-                             (캡션 있으면 caption 수정, 없으면 text 수정)
-            photo_urls: 사진 URL 목록 (없으면 빈 리스트)
+            photo_urls: 전체 사진 URL 목록 (없으면 빈 리스트)
             author_sig: 작성자 서명 (author_signature)
+            floor_photos: 층별 사진 그룹 [{"label": "1층", "photos": [...]}]
+                          None이면 구분 없이 flat 표시
         """
         try:
             property_data = self.parser.parse_property_info(description)
@@ -2232,6 +2543,7 @@ class TelegramNotionBot:
             page_url, page_id = self.notion_uploader.upload_property(
                 property_data,
                 photo_urls if photo_urls else None,
+                floor_photos=floor_photos,
             )
 
             # 매핑 저장
@@ -2677,26 +2989,42 @@ class TelegramNotionBot:
             )
             return
 
-        # ── 층수 라벨인지 확인 (20자 이하 짧은 텍스트) ──
-        # 채팅 버퍼에 사진이 있을 때만 버퍼 만료 타이머 리셋
+        # ── 층수 라벨인지 확인 (30자 이하 짧은 텍스트) ──
+        # 채팅 버퍼에 사진이 있을 때만 층수 라벨로 처리
         text_stripped = text.strip()
         if (
-            len(text_stripped) <= 20
-            and message.chat_id in self._chat_buffers
+            len(text_stripped) <= 30
             and not text_stripped.startswith("/")
         ):
-            # 층수 라벨로 인식 ("1층", "2층", "B1층" 등)
-            # 버퍼 만료 타이머 리셋 (2분 연장)
-            existing = self._collect_tasks.get(message.chat_id)
-            if existing:
-                existing.cancel()
-            self._collect_tasks[message.chat_id] = asyncio.create_task(
-                self._expire_chat_buffer(message.chat_id)
+            # 층수 패턴 감지: "1층", "2층", "B1층", "지하층", "1,2층" 등
+            floor_match = re.search(
+                r'([B지하]?\d*(?:[,~\-]\d+)*층)', text_stripped
             )
-            logger.debug(
-                f"층수 라벨 인식: '{text_stripped}', "
-                f"버퍼 타이머 리셋 (chat_id={message.chat_id})"
-            )
+
+            if message.chat_id in self._chat_buffers:
+                if floor_match:
+                    # 층수 라벨 → 버퍼에 라벨 추가 (사진 그룹 구분)
+                    floor_label = floor_match.group(1)
+                    self._add_floor_label_to_buffer(
+                        message.chat_id, floor_label
+                    )
+                    logger.debug(
+                        f"층수 라벨 인식: '{floor_label}' "
+                        f"(chat_id={message.chat_id})"
+                    )
+                else:
+                    # 층수 패턴은 없지만 짧은 텍스트 → 타이머 리셋만
+                    logger.debug(
+                        f"짧은 텍스트 (층수아님): '{text_stripped}'"
+                    )
+
+                # 버퍼 만료 타이머 리셋 (2분 연장)
+                existing = self._collect_tasks.get(message.chat_id)
+                if existing:
+                    existing.cancel()
+                self._collect_tasks[message.chat_id] = asyncio.create_task(
+                    self._expire_chat_buffer(message.chat_id)
+                )
 
     # ──────────────────────────────────────────────
     # 봇 실행
