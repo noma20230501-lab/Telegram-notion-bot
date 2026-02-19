@@ -1788,39 +1788,58 @@ class TelegramNotionBot:
         # 동기화용 Notion 속성 초기화
         self.notion_uploader.ensure_sync_properties()
 
+    @staticmethod
+    def _normalize_korean_name(name: str) -> str:
+        """한국 이름 순서 정규화
+
+        텔레그램 서명은 프로필 설정에 따라 "이름 성" 순서로 오는 경우가 있음.
+        예: "진우 박" → "박진우",  "도희 김" → "김도희"
+            "박 진우" → "박진우"  (올바른 순서, 공백만 제거)
+
+        규칙:
+          - 단어 2개 + 마지막이 1글자 → 성이 뒤에 온 것 → 앞뒤 교체
+          - 단어 2개 + 첫 번째가 1글자 → 이미 "성 이름" → 공백만 제거
+          - 그 외                       → 공백 제거 후 그대로 사용
+        """
+        parts = name.strip().split()
+        if len(parts) == 2:
+            if len(parts[-1]) == 1:
+                # "진우 박" → "박진우"
+                return parts[-1] + parts[0]
+            elif len(parts[0]) == 1:
+                # "박 진우" → "박진우"
+                return parts[0] + parts[1]
+        # 공백 모두 제거
+        return re.sub(r"\s+", "", name)
+
     def _match_staff_name(self, signature: Optional[str]) -> Optional[str]:
         """채널 서명에서 매물접수자 이름 매칭
 
         Args:
             signature: message.author_signature 값
-                       (텔레그램은 성·이름 사이 공백 포함 가능: "박 진우")
+                       (텔레그램 프로필 이름 형식: "진우 박" 또는 "박진우" 등)
 
         Returns:
-            매칭된 이름 또는 None
+            정규화된 이름 (예: "박진우") 또는 None
         """
         if not signature:
             logger.debug("author_signature가 없음")
             return None
 
         sig = signature.strip()
-        # 공백 제거 정규화 (예: "박 진우" → "박진우")
-        sig_norm = re.sub(r"\s+", "", sig)
-        logger.info(f"서명 매칭 시도: '{sig}' (정규화: '{sig_norm}')")
+        # 한국 이름 순서 정규화 ("진우 박" → "박진우")
+        sig_norm = self._normalize_korean_name(sig)
+        logger.info(f"서명 매칭 시도: '{sig}' → 정규화: '{sig_norm}'")
 
         for name in self._staff_names:
             name_norm = re.sub(r"\s+", "", name)
-
-            # 1. 공백 제거 후 정확한 포함 관계 확인
-            if name_norm in sig_norm or sig_norm in name_norm:
+            if name_norm == sig_norm or name_norm in sig_norm or sig_norm in name_norm:
                 logger.info(f"매칭 성공: '{sig}' → '{name}'")
                 return name
 
-        # 미리 등록된 이름과 매칭 안 되면 서명을 그대로 사용
-        # (새로운 직원이 추가됐거나 이름 목록에 없는 경우에도 저장)
-        logger.info(
-            f"이름 목록 미매칭, 서명 그대로 저장: '{sig}'"
-        )
-        return sig[:30] if sig else None
+        # 미리 등록된 이름과 매칭 안 되면 정규화된 서명을 그대로 사용
+        logger.info(f"이름 목록 미매칭, 정규화 서명 저장: '{sig_norm}'")
+        return sig_norm[:30] if sig_norm else None
 
     @staticmethod
     def _is_listing_format(
