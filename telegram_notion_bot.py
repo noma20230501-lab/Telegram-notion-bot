@@ -989,10 +989,10 @@ class NotionUploader:
                 "select": {"name": property_data["위반건축물"]}
             }
 
-        # ── 🙋🏻‍♂️매물접수 (select) ──
+        # ── 🙋🏻‍♂️매물접수 (multi_select) ──
         if "매물접수" in property_data:
             properties["🙋🏻‍♂️매물접수"] = {
-                "select": {"name": property_data["매물접수"]}
+                "multi_select": [{"name": property_data["매물접수"]}]
             }
 
         # ── 📅등록 날짜 (date) - 신규 등록 시에만 ──
