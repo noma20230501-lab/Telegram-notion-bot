@@ -989,9 +989,9 @@ class NotionUploader:
                 "select": {"name": property_data["위반건축물"]}
             }
 
-        # ── 매물접수 (select) ──
+        # ── 🙋🏻‍♂️매물접수 (select) ──
         if "매물접수" in property_data:
-            properties["매물접수"] = {
+            properties["🙋🏻‍♂️매물접수"] = {
                 "select": {"name": property_data["매물접수"]}
             }
 
