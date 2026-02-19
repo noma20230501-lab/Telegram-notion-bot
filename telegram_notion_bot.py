@@ -230,14 +230,29 @@ class PropertyParser:
                 
                 # 모든 층 정보를 저장할 딕셔너리 (층 번호를 키로 사용)
                 층별_정보 = {}
-                
-                # 1단계: 간소화 패턴 파싱 (예: "3층 50/40")
-                간소화_패턴 = re.findall(
-                    r'(\d+)층\s+(\d+\.?\d*)\s*/\s*(\d+\.?\d*)',
+
+                # ── 면적 패턴 파싱 (다양한 입력 형식 통합 지원) ──
+                # 지원 형식:
+                #   1층 40/40          (기본)
+                #   1층 계약40/40      (계약 접두사)
+                #   1층 40/전용40      (전용 접두사)
+                #   1층 계약40/전용40  (둘 다)
+                #   1층 계약40,전용40  (콤마 구분)
+                #   1층 계약40 전용40  (공백+전용 구분)
+                #   1층 40.5/33.05     (소수점)
+                #   1층 40㎡/33㎡      (단위 포함)
+                면적_패턴 = re.findall(
+                    r'(\d+)층\s+'
+                    r'(?:계(?:약)?(?:면적)?\s*)?'   # 선택적 "계약" 접두사
+                    r'(\d+\.?\d*)'                   # 계약면적 숫자
+                    r'\s*(?:m2|㎡)?\s*'              # 선택적 단위
+                    r'(?:[/,]\s*|\s+(?=전))'         # 구분자: / 또는 , 또는 "전용" 앞 공백
+                    r'(?:전(?:용)?(?:면적)?\s*)?'    # 선택적 "전용" 접두사
+                    r'(\d+\.?\d*)',                  # 전용면적 숫자
                     content4
                 )
-                
-                for 층, 계약, 전용 in 간소화_패턴:
+
+                for 층, 계약, 전용 in 면적_패턴:
                     계약_f = float(계약)
                     전용_f = float(전용)
                     평 = round(전용_f / 3.3, 1)
@@ -246,8 +261,9 @@ class PropertyParser:
                         '전용': 전용_f,
                         '평': 평
                     }
-                
-                # 2단계: 상세 패턴 파싱 (예: "1층 계약48.43㎡ 전용48.43㎡ 14평" 또는 "1층 48.43㎡ 전용48.43㎡ 14평")
+
+                # 평수 명시 패턴 (예: "1층 계약48.43㎡ 전용48.43㎡ 14평")
+                # 위 패턴에서 못 잡은 경우만 추가 처리
                 상세_패턴 = re.findall(
                     r'(\d+)층[^/]*?'
                     r'(?:계(?:약)?(?:면적)?\s*)?(\d+\.?\d*)\s*(?:m2|㎡)?[^/]*?'
@@ -255,9 +271,9 @@ class PropertyParser:
                     r'(?:약\s*)?(\d+\.?\d*)\s*평',
                     content4
                 )
-                
+
                 for 층, 계약, 전용, 평 in 상세_패턴:
-                    if 층 not in 층별_정보:  # 간소화 패턴과 중복 방지
+                    if 층 not in 층별_정보:  # 위 패턴과 중복 방지
                         층별_정보[층] = {
                             '계약': float(계약) if 계약 else 0,
                             '전용': float(전용) if 전용 else 0,
@@ -295,20 +311,48 @@ class PropertyParser:
                     data["전용면적"] = 총_전용
                     data["층별면적상세"] = " ".join(층별_평수_parts)
                 else:
-                    # 일반 매물 (기존 로직)
-                    계약_match = re.search(
-                        r"계약(?:면적)?\s*(\d+\.?\d*)\s*(?:m2|㎡)",
-                        content4,
-                    )
-                    if 계약_match:
-                        data["계약면적"] = float(계약_match.group(1))
+                    # 단일 매물 면적 파싱 (단위 없이도 인식, 다양한 구분자 지원)
+                    # 지원 형식:
+                    #   계약 144m2 / 전용 33m2   (기존, 단위 있음)
+                    #   계약 144 / 전용 33        (단위 없음)
+                    #   계약 144 전용 33          (공백 구분)
+                    #   계약144/144              (슬래시)
+                    #   계약면적144/144
+                    #   144/전용144
+                    #   144/전용면적144
+                    #   144/144                  (키워드 없이)
+                    #   계약144,전용144           (콤마)
+                    found_area = False
 
-                    전용_match = re.search(
-                        r"전용(?:면적)?\s*(\d+\.?\d*)\s*(?:m2|㎡)",
-                        content4,
+                    # ── 1순위: 통합 패턴 (계약N[단위][구분자]전용N) ──
+                    통합_match = re.search(
+                        r'(?:계(?:약)?(?:면적)?\s*)?'
+                        r'(\d+\.?\d*)\s*(?:m2|㎡)?\s*'
+                        r'(?:[/,]\s*|\s+(?=전))'
+                        r'(?:전(?:용)?(?:면적)?\s*)?'
+                        r'(\d+\.?\d*)',
+                        content4
                     )
-                    if 전용_match:
-                        data["전용면적"] = float(전용_match.group(1))
+                    if 통합_match:
+                        data["계약면적"] = float(통합_match.group(1))
+                        data["전용면적"] = float(통합_match.group(2))
+                        found_area = True
+
+                    if not found_area:
+                        # ── 2순위: 계약/전용 키워드를 각각 따로 탐색 ──
+                        # (중간에 "약10평" 같은 부가 텍스트가 있을 때 대비)
+                        계약_match = re.search(
+                            r"계(?:약)?(?:면적)?\s*(\d+\.?\d*)\s*(?:m2|㎡)?",
+                            content4,
+                        )
+                        전용_match = re.search(
+                            r"전(?:용)?(?:면적)?\s*(\d+\.?\d*)\s*(?:m2|㎡)?",
+                            content4,
+                        )
+                        if 계약_match:
+                            data["계약면적"] = float(계약_match.group(1))
+                        if 전용_match:
+                            data["전용면적"] = float(전용_match.group(1))
 
                 # ── 건축물용도 파싱 (층별 다용도 지원) ──
                 floor_use_pairs = PropertyParser._parse_floor_uses(content4)
@@ -733,8 +777,12 @@ class NotionUploader:
                 properties={
                     "telegram_chat_id": {"number": {}},
                     "telegram_msg_id": {"number": {}},
-                    # 층별 용도 상세 필드 (신규)
+                    # 층별 용도 상세 필드
                     "층별용도": {"rich_text": {}},
+                    # 거래 완료 관련
+                    "거래완료 시점": {"rich_text": {}},
+                    # 계약 담당자 (select)
+                    "계약담당자": {"select": {}},
                 },
             )
             logger.info("동기화용 Notion 속성 확인 완료")
@@ -1040,6 +1088,12 @@ class NotionUploader:
                 ]
             }
 
+        # ── 계약담당자 (select) ──
+        if "계약담당자" in property_data:
+            properties["계약담당자"] = {
+                "select": {"name": property_data["계약담당자"]}
+            }
+
         # ── 텔레그램 동기화 정보 (number) ──
         if "telegram_chat_id" in property_data:
             properties["telegram_chat_id"] = {
@@ -1324,6 +1378,157 @@ class NotionUploader:
             logger.error(f"노션 아카이브 실패: {e}")
             raise Exception(f"노션 아카이브 실패: {str(e)}")
 
+    def update_deal_status(
+        self, page_id: str, agent_name: str = None
+    ) -> bool:
+        """거래 상태를 '거래 완료'로 업데이트하고 계약담당자 기록
+
+        Args:
+            page_id: 업데이트할 노션 페이지 ID
+            agent_name: 계약 담당자 이름 (없으면 None)
+
+        Returns:
+            성공 여부
+        """
+        try:
+            now = datetime.now()
+            properties = {
+                "거래 상태": {
+                    "select": {"name": "거래 완료"}
+                },
+                "거래완료 시점": {
+                    "rich_text": [
+                        {"text": {"content": now.strftime("%Y-%m-%d %H:%M")}}
+                    ]
+                },
+            }
+            if agent_name:
+                properties["계약담당자"] = {
+                    "select": {"name": agent_name}
+                }
+            self.client.pages.update(
+                page_id=page_id,
+                properties=properties,
+            )
+            logger.info(
+                f"거래완료 업데이트 성공: page={page_id}, "
+                f"담당자={agent_name}"
+            )
+            return True
+        except Exception as e:
+            logger.error(f"거래완료 업데이트 실패: {e}")
+            return False
+
+    def append_blocks_to_page(
+        self, page_id: str, blocks: List[Dict]
+    ) -> bool:
+        """기존 노션 페이지 하단에 블록 추가 (추가사진 등)"""
+        try:
+            self.client.blocks.children.append(
+                block_id=page_id,
+                children=blocks,
+            )
+            return True
+        except Exception as e:
+            logger.error(f"노션 블록 추가 실패: {e}")
+            return False
+
+    def find_page_by_msg_id(self, msg_id: int) -> Optional[str]:
+        """telegram_msg_id로 노션 페이지 ID 조회 (봇 재시작 후 복구용)"""
+        try:
+            response = self.client.databases.query(
+                database_id=self.database_id,
+                filter={
+                    "property": "telegram_msg_id",
+                    "number": {"equals": msg_id},
+                },
+                page_size=1,
+            )
+            for page in response.get("results", []):
+                if not page.get("archived", False):
+                    return page["id"]
+            return None
+        except Exception as e:
+            logger.error(f"msg_id 검색 실패: {e}")
+            return None
+
+    def find_pages_by_address(
+        self, address: str, exclude_page_id: str = None
+    ) -> List[Dict]:
+        """주소로 노션 페이지 검색 (동일 주소 중복 감지용)
+
+        Args:
+            address: 검색할 주소 문자열
+            exclude_page_id: 결과에서 제외할 페이지 ID (새로 만든 페이지)
+
+        Returns:
+            [{"page_id": str, "title": str, "url": str}, ...]
+        """
+        try:
+            # 괄호 부분 제거 후 핵심 주소만 사용 (너무 짧으면 오탐 방지)
+            clean_addr = address.split("(")[0].strip()
+            if len(clean_addr) < 5:
+                return []
+
+            results = []
+            has_more = True
+            start_cursor = None
+
+            while has_more:
+                query_params: Dict = {
+                    "database_id": self.database_id,
+                    "filter": {
+                        "property": "주소 및 상호",
+                        "title": {"contains": clean_addr},
+                    },
+                    "page_size": 100,
+                }
+                if start_cursor:
+                    query_params["start_cursor"] = start_cursor
+
+                response = self.client.databases.query(**query_params)
+
+                for page in response.get("results", []):
+                    if page.get("archived", False):
+                        continue
+                    pid = page["id"]
+                    # 방금 생성한 페이지 제외
+                    if exclude_page_id and (
+                        pid.replace("-", "")
+                        == exclude_page_id.replace("-", "")
+                    ):
+                        continue
+
+                    props = page.get("properties", {})
+                    title_list = props.get(
+                        "주소 및 상호", {}
+                    ).get("title", [])
+                    title = (
+                        title_list[0]
+                        .get("text", {})
+                        .get("content", "")
+                        if title_list
+                        else ""
+                    )
+                    results.append(
+                        {
+                            "page_id": pid,
+                            "title": title,
+                            "url": (
+                                "https://www.notion.so/"
+                                f"{pid.replace('-', '')}"
+                            ),
+                        }
+                    )
+
+                has_more = response.get("has_more", False)
+                start_cursor = response.get("next_cursor")
+
+            return results
+        except Exception as e:
+            logger.error(f"주소 검색 실패: {e}")
+            return []
+
     def get_page_properties(self, page_id: str) -> Dict:
         """노션 페이지의 현재 속성값을 파싱하여 반환"""
         try:
@@ -1571,6 +1776,8 @@ class TelegramNotionBot:
         self._save_tasks: Dict[int, asyncio.Task] = {}
         # 2분 버퍼 만료 태스크
         self._collect_tasks: Dict[int, asyncio.Task] = {}
+        # 추가사진 버퍼: {orig_msg_id: {"photos": [], "label": str, "page_id": str, "timer_task": Task}}
+        self._extra_photo_buffers: Dict[int, Dict] = {}
 
         # 매물접수자 이름 목록 (노션 셀렉트 옵션과 일치해야 함)
         self._staff_names = [
@@ -1586,6 +1793,7 @@ class TelegramNotionBot:
 
         Args:
             signature: message.author_signature 값
+                       (텔레그램은 성·이름 사이 공백 포함 가능: "박 진우")
 
         Returns:
             매칭된 이름 또는 None
@@ -1593,24 +1801,26 @@ class TelegramNotionBot:
         if not signature:
             logger.debug("author_signature가 없음")
             return None
-        
+
         sig = signature.strip()
-        logger.info(f"서명 매칭 시도: '{sig}'")
-        
-        # 1. 정확한 매칭: 서명에 전체 이름이 포함되어 있는지
+        # 공백 제거 정규화 (예: "박 진우" → "박진우")
+        sig_norm = re.sub(r"\s+", "", sig)
+        logger.info(f"서명 매칭 시도: '{sig}' (정규화: '{sig_norm}')")
+
         for name in self._staff_names:
-            if name in sig:
+            name_norm = re.sub(r"\s+", "", name)
+
+            # 1. 공백 제거 후 정확한 포함 관계 확인
+            if name_norm in sig_norm or sig_norm in name_norm:
                 logger.info(f"매칭 성공: '{sig}' → '{name}'")
                 return name
-        
-        # 2. 역방향 매칭: 서명이 이름의 일부인지 (예: "박진" → "박진우")
-        for name in self._staff_names:
-            if sig in name:
-                logger.info(f"역방향 매칭 성공: '{sig}' → '{name}'")
-                return name
-        
-        logger.warning(f"매칭 실패: '{sig}' (등록된 이름: {self._staff_names})")
-        return None
+
+        # 미리 등록된 이름과 매칭 안 되면 서명을 그대로 사용
+        # (새로운 직원이 추가됐거나 이름 목록에 없는 경우에도 저장)
+        logger.info(
+            f"이름 목록 미매칭, 서명 그대로 저장: '{sig}'"
+        )
+        return sig[:30] if sig else None
 
     @staticmethod
     def _is_listing_format(
@@ -1961,6 +2171,75 @@ class TelegramNotionBot:
     # ──────────────────────────────────────────────
     # 답장(Reply) 기반 매물 수정 기능
     # ──────────────────────────────────────────────
+
+    @staticmethod
+    def _parse_deal_complete(text: str) -> Tuple[bool, Optional[str]]:
+        """거래완료/계약완료 답장 패턴 감지 및 담당자 이름 추출
+
+        인식 패턴 (괄호 종류·공백 무관):
+            (계약완료), [거래완료]
+            (계약완료 박진우), [거래완료 김동영]
+            (계약 완료 박진우), (거래완료박진우)
+
+        Returns:
+            (is_deal_complete, agent_name_or_None)
+        """
+        if not text:
+            return False, None
+        m = re.search(
+            r'[\(\[]\s*(?:계약|거래)\s*완료\s*([^\)\]]*)\s*[\)\]]',
+            text,
+        )
+        if m:
+            agent_raw = m.group(1).strip()
+            # 공백 정규화 (앞뒤 공백 제거, 내부 다중 공백 단일화)
+            agent_clean = re.sub(r'\s+', ' ', agent_raw).strip()
+            return True, agent_clean if agent_clean else None
+        return False, None
+
+    async def _handle_deal_complete_reply(
+        self,
+        message,
+        context,
+        agent_name: Optional[str],
+    ):
+        """거래완료 답장 처리 → 노션 '거래 상태' 업데이트
+
+        Args:
+            message: 답장 메시지 객체
+            context: 텔레그램 컨텍스트
+            agent_name: 계약 담당자 이름 (없으면 None)
+        """
+        reply = message.reply_to_message
+        if not reply:
+            return
+
+        page_id = self._get_page_id_from_reply(reply)
+        if not page_id:
+            logger.debug(
+                f"거래완료 답장: 연결된 노션 페이지 없음 "
+                f"(msg_id={reply.message_id})"
+            )
+            return
+
+        success = self.notion_uploader.update_deal_status(
+            page_id, agent_name
+        )
+        if success:
+            result_msg = "✅ 거래 완료 처리됐습니다."
+            if agent_name:
+                result_msg += f"\n👤 계약담당자: {agent_name}"
+            try:
+                await message.reply_text(result_msg)
+            except Exception:
+                pass
+        else:
+            try:
+                await message.reply_text(
+                    "⚠️ 거래완료 처리 중 오류가 발생했습니다."
+                )
+            except Exception:
+                pass
 
     def _get_page_id_from_reply(
         self, reply_message
@@ -2581,6 +2860,36 @@ class TelegramNotionBot:
                 f"사진 {len(photo_urls)}장"
             )
 
+            # ── 동일 주소 중복 감지 알림 (방법 A) ──
+            address = property_data.get("주소", "")
+            if address:
+                duplicates = (
+                    self.notion_uploader.find_pages_by_address(
+                        address, exclude_page_id=page_id
+                    )
+                )
+                if duplicates:
+                    dup_msg = (
+                        f"⚠️ 동일 주소 매물 감지!\n"
+                        f"📍 {address}\n\n"
+                        f"기존 등록된 매물:\n"
+                    )
+                    for dup in duplicates[:3]:
+                        dup_msg += (
+                            f"• {dup['title']}\n"
+                            f"  🔗 {dup['url']}\n"
+                        )
+                    if len(duplicates) > 3:
+                        dup_msg += f"... 외 {len(duplicates) - 3}개\n"
+                    dup_msg += (
+                        "\n💡 기존 매물 확인 후 "
+                        "필요시 보관처리 해주세요."
+                    )
+                    try:
+                        await trigger_message.reply_text(dup_msg)
+                    except Exception:
+                        pass
+
         except Exception as e:
             logger.error(f"매물 저장 오류: {e}", exc_info=True)
             try:
@@ -2622,6 +2931,16 @@ class TelegramNotionBot:
                 logger.error(f"사진 URL 가져오기 실패: {e}")
                 return
 
+            # ── 답장인 경우 추가사진 여부 확인 ──
+            if message.reply_to_message:
+                handled = await self._handle_extra_photo_reply(
+                    message, context, [photo_url], caption
+                )
+                if handled:
+                    return
+                # 추가사진이 아닌 답장 사진 → 무시
+                return
+
             # 채팅 버퍼에 사진 추가
             self._add_photos_to_buffer(
                 message.chat_id, [photo_url], message,
@@ -2647,6 +2966,7 @@ class TelegramNotionBot:
                 "message": message,
                 "author_signature": message.author_signature,
                 "context": context,  # 30초 저장 버퍼에서 사용
+                "reply_to_message": message.reply_to_message,  # 답장 대상 메시지
             }
 
         # 사진 추가 (가장 큰 해상도)
@@ -2692,7 +3012,18 @@ class TelegramNotionBot:
         photo_urls = group_data["photos"]
         context = group_data.get("context")
         author_sig = group_data.get("author_signature")
+        reply_to = group_data.get("reply_to_message")
         chat_id = message.chat_id
+
+        # ── 답장 앨범인 경우 추가사진 여부 확인 ──
+        if reply_to and context:
+            handled = await self._handle_extra_photo_reply(
+                message, context, photo_urls, caption
+            )
+            if handled:
+                return
+            # 추가사진이 아닌 답장 앨범 → 무시 (일반 채팅 답장 등)
+            return
 
         # 사진을 채팅 버퍼에 추가 (복수 미디어그룹 묶음 처리)
         self._add_photos_to_buffer(chat_id, photo_urls, message, author_sig)
@@ -2965,6 +3296,168 @@ class TelegramNotionBot:
     # 텍스트 메시지 처리
     # ──────────────────────────────────────────────
 
+    # ──────────────────────────────────────────────
+    # 추가사진 기능 (답장으로 기존 노션 매물에 사진 추가)
+    # ──────────────────────────────────────────────
+
+    @staticmethod
+    def _is_extra_photo_caption(caption: str) -> Tuple[bool, str]:
+        """추가사진 캡션 감지 및 라벨 추출
+
+        인식 패턴 (공백/순서 무관):
+            추가사진, 추가 사진, 철거 추가사진,
+            추가사진 철거, 추가 철거사진 등
+
+        Returns:
+            (is_extra, label)
+            - is_extra: True면 추가사진 답장
+            - label: "추가사진" 또는 "추가사진 (철거)" 등
+        """
+        if not caption:
+            return False, ""
+        # 공백 제거 후 키워드 체크
+        normalized = re.sub(r"\s+", "", caption)
+        if "추가" in normalized and "사진" in normalized:
+            # '추가', '사진' 제거 후 남은 키워드 → 부가 라벨
+            extra_kw = re.sub(r"[추가사진]", "", caption)
+            extra_kw = re.sub(r"\s+", " ", extra_kw).strip()
+            label = f"추가사진 ({extra_kw})" if extra_kw else "추가사진"
+            return True, label
+        return False, ""
+
+    def _get_extra_photo_page_id(
+        self, orig_msg_id: int
+    ) -> Optional[str]:
+        """원본 메시지 ID → 노션 페이지 ID 조회
+        메모리 매핑 우선, 없으면 노션 DB 검색
+        """
+        if orig_msg_id in self._page_mapping:
+            return self._page_mapping[orig_msg_id]
+        return self.notion_uploader.find_page_by_msg_id(orig_msg_id)
+
+    async def _handle_extra_photo_reply(
+        self,
+        message,
+        context,
+        photo_urls: List[str],
+        caption: str = None,
+    ) -> bool:
+        """사진 답장 처리 → 추가사진이면 노션에 추가하고 True 반환"""
+        reply = message.reply_to_message
+        if not reply:
+            return False
+
+        orig_msg_id = reply.message_id
+        cap = caption or message.caption or ""
+
+        is_extra, extra_label = self._is_extra_photo_caption(cap)
+        already_in_buffer = orig_msg_id in self._extra_photo_buffers
+
+        if not (is_extra or already_in_buffer):
+            # 추가사진 캡션도 없고 기존 버퍼도 없음 → 무시
+            return False
+
+        page_id = self._get_extra_photo_page_id(orig_msg_id)
+        if not page_id:
+            logger.debug(
+                f"답장 대상 메시지({orig_msg_id})의 노션 페이지 없음 - 무시"
+            )
+            return False
+
+        label = (
+            extra_label
+            if is_extra
+            else self._extra_photo_buffers.get(
+                orig_msg_id, {}
+            ).get("label", "추가사진")
+        )
+
+        await self._schedule_extra_photo_save(
+            orig_msg_id, photo_urls, label, page_id, context.bot
+        )
+        logger.info(
+            f"추가사진 버퍼 추가: orig_msg={orig_msg_id}, "
+            f"{len(photo_urls)}장, 라벨={label}"
+        )
+        return True
+
+    async def _schedule_extra_photo_save(
+        self,
+        orig_msg_id: int,
+        photos: List[str],
+        label: str,
+        page_id: str,
+        bot,
+    ):
+        """추가사진 버퍼에 사진 추가 + 30초 타이머 리셋"""
+        if orig_msg_id not in self._extra_photo_buffers:
+            self._extra_photo_buffers[orig_msg_id] = {
+                "photos": [],
+                "label": label,
+                "page_id": page_id,
+                "timer_task": None,
+            }
+
+        buf = self._extra_photo_buffers[orig_msg_id]
+        buf["photos"].extend(photos)
+        if label:
+            buf["label"] = label  # 새 라벨로 업데이트
+
+        # 기존 타이머 취소 후 30초 재시작
+        if buf.get("timer_task"):
+            buf["timer_task"].cancel()
+        buf["timer_task"] = asyncio.create_task(
+            self._do_save_extra_photos(orig_msg_id, bot)
+        )
+
+    async def _do_save_extra_photos(
+        self, orig_msg_id: int, bot
+    ):
+        """30초 대기 후 추가사진을 노션 페이지에 저장"""
+        await asyncio.sleep(self.PROPERTY_SAVE_BUFFER)
+
+        buf = self._extra_photo_buffers.pop(orig_msg_id, None)
+        if not buf:
+            return
+
+        photos = buf.get("photos", [])
+        label = buf.get("label", "추가사진")
+        page_id = buf.get("page_id")
+
+        if not photos or not page_id:
+            return
+
+        date_str = datetime.now().strftime("%y.%m.%d")
+        full_label = f"{label} {date_str}"
+
+        # 노션 블록: 구분선 + 헤딩 + 사진
+        blocks: List[Dict] = [
+            {"object": "block", "type": "divider", "divider": {}},
+            {
+                "object": "block",
+                "type": "heading_2",
+                "heading_2": {
+                    "rich_text": [
+                        {"text": {"content": f"📷 {full_label}"}}
+                    ]
+                },
+            },
+        ]
+        blocks.extend(
+            self.notion_uploader._build_photo_blocks(photos)
+        )
+
+        success = self.notion_uploader.append_blocks_to_page(
+            page_id, blocks
+        )
+        if success:
+            logger.info(
+                f"추가사진 저장 완료: page_id={page_id}, "
+                f"{len(photos)}장, 라벨={full_label}"
+            )
+        else:
+            logger.error(f"추가사진 저장 실패: page_id={page_id}")
+
     async def handle_text_message(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ):
@@ -2979,6 +3472,16 @@ class TelegramNotionBot:
 
         text = message.text or message.caption
         if not text:
+            return
+
+        # 텍스트 답장: 거래완료/계약완료 패턴만 처리, 나머지 무시
+        # (예: "월세 조정됐습니다" 같은 알림성 답장은 노션에 저장하지 않음)
+        if message.reply_to_message:
+            is_deal, agent = self._parse_deal_complete(text)
+            if is_deal:
+                await self._handle_deal_complete_reply(
+                    message, context, agent
+                )
             return
 
         # ── 매물 설명인지 확인 (1. 2. 3... 번호 형식) ──
