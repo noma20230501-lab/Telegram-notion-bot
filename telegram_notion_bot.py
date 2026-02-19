@@ -2166,6 +2166,8 @@ class TelegramNotionBot:
         author_sig = buf.get("author_signature") or getattr(
             trigger_message, "author_signature", None
         )
+        # 첫 사진 메시지 (추가사진 답장 탐색에 사용)
+        first_photo_msg = buf.get("first_message")
 
         # 전체 사진 URL 목록 (flat)
         photo_urls: List[str] = []
@@ -2185,6 +2187,7 @@ class TelegramNotionBot:
         await self._save_property_to_notion(
             description, trigger_message, photo_urls, author_sig,
             floor_photos=floor_photos_arg,
+            first_photo_msg=first_photo_msg,
         )
 
     # ──────────────────────────────────────────────
@@ -2812,6 +2815,7 @@ class TelegramNotionBot:
         photo_urls: List[str],
         author_sig: str = None,
         floor_photos: Optional[List[Dict]] = None,
+        first_photo_msg=None,
     ):
         """매물 정보를 노션에 저장하고 원본 메시지에 노션 링크 추가
 
@@ -2844,12 +2848,19 @@ class TelegramNotionBot:
                 floor_photos=floor_photos,
             )
 
-            # 매핑 저장
+            # 매핑 저장 (설명 메시지)
             self._page_mapping[trigger_message.message_id] = page_id
             self._original_texts[trigger_message.message_id] = description
             self._msg_chat_ids[trigger_message.message_id] = (
                 trigger_message.chat_id
             )
+            # 첫 사진 메시지 ID도 매핑 저장 (추가사진 답장 시 사진에 답장해도 찾을 수 있게)
+            if first_photo_msg and first_photo_msg.message_id != trigger_message.message_id:
+                self._page_mapping[first_photo_msg.message_id] = page_id
+                self._msg_chat_ids[first_photo_msg.message_id] = first_photo_msg.chat_id
+                logger.debug(
+                    f"첫 사진 메시지 매핑 저장: msg_id={first_photo_msg.message_id} → page_id={page_id}"
+                )
 
             # 원본 메시지에 노션 링크 추가
             notion_html = self._build_notion_section(
@@ -3037,7 +3048,8 @@ class TelegramNotionBot:
         # ── 답장 앨범인 경우 추가사진 여부 확인 ──
         if reply_to and context:
             handled = await self._handle_extra_photo_reply(
-                message, context, photo_urls, caption
+                message, context, photo_urls, caption,
+                reply_message=reply_to,  # group_data에서 확실히 꺼낸 reply_to 전달
             )
             if handled:
                 return
@@ -3345,13 +3357,30 @@ class TelegramNotionBot:
         return False, ""
 
     def _get_extra_photo_page_id(
-        self, orig_msg_id: int
+        self,
+        orig_msg_id: int,
+        reply_message=None,
     ) -> Optional[str]:
         """원본 메시지 ID → 노션 페이지 ID 조회
-        메모리 매핑 우선, 없으면 노션 DB 검색
+
+        탐색 순서:
+          1. 메모리 매핑 (_page_mapping)
+          2. 원본 메시지 텍스트에 포함된 Notion URL 파싱
+          3. 노션 DB에서 telegram_msg_id로 검색
         """
+        # 1. 메모리 매핑
         if orig_msg_id in self._page_mapping:
             return self._page_mapping[orig_msg_id]
+
+        # 2. 원본 메시지에 첨부된 Notion URL 파싱 (봇 재시작 후에도 동작)
+        if reply_message:
+            page_id = self._get_page_id_from_reply(reply_message)
+            if page_id:
+                # 매핑에 캐싱해 두어 다음 호출 빠르게
+                self._page_mapping[orig_msg_id] = page_id
+                return page_id
+
+        # 3. 노션 DB 검색 (telegram_msg_id 속성으로)
         return self.notion_uploader.find_page_by_msg_id(orig_msg_id)
 
     async def _handle_extra_photo_reply(
@@ -3360,9 +3389,15 @@ class TelegramNotionBot:
         context,
         photo_urls: List[str],
         caption: str = None,
+        reply_message=None,
     ) -> bool:
-        """사진 답장 처리 → 추가사진이면 노션에 추가하고 True 반환"""
-        reply = message.reply_to_message
+        """사진 답장 처리 → 추가사진이면 노션에 추가하고 True 반환
+
+        Args:
+            reply_message: 명시적으로 전달된 reply_to_message 객체.
+                           없으면 message.reply_to_message 사용.
+        """
+        reply = reply_message or message.reply_to_message
         if not reply:
             return False
 
@@ -3376,11 +3411,20 @@ class TelegramNotionBot:
             # 추가사진 캡션도 없고 기존 버퍼도 없음 → 무시
             return False
 
-        page_id = self._get_extra_photo_page_id(orig_msg_id)
+        page_id = self._get_extra_photo_page_id(orig_msg_id, reply_message=reply)
         if not page_id:
-            logger.debug(
-                f"답장 대상 메시지({orig_msg_id})의 노션 페이지 없음 - 무시"
+            logger.warning(
+                f"추가사진: 원본 메시지({orig_msg_id})의 노션 페이지를 찾을 수 없음"
             )
+            try:
+                await message.reply_text(
+                    "⚠️ 추가사진을 저장할 노션 페이지를 찾지 못했습니다.\n\n"
+                    "📌 해결방법:\n"
+                    "매물 설명 텍스트가 있는 메시지(맨 아래 ✅ Notion 링크가 달린 메시지)에 "
+                    "답장하여 사진을 다시 올려주세요."
+                )
+            except Exception:
+                pass
             return False
 
         label = (
