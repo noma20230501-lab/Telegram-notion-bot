@@ -3673,24 +3673,31 @@ class TelegramNotionBot:
             if address:
                 cap = caption or message.caption or message.text or ""
                 new_text = f"{address}\n{cap.strip()}"
+                edited = False
+                # 캡션 수정 시도 (사진 앨범인 경우)
                 try:
-                    if message.photo:
-                        # 사진 메시지 → 캡션 수정
-                        await context.bot.edit_message_caption(
-                            chat_id=message.chat_id,
-                            message_id=message.message_id,
-                            caption=new_text,
-                        )
-                    else:
-                        # 텍스트 메시지 → 텍스트 수정
+                    await context.bot.edit_message_caption(
+                        chat_id=message.chat_id,
+                        message_id=message.message_id,
+                        caption=new_text,
+                    )
+                    edited = True
+                    logger.info(f"추가사진 캡션 수정 성공: '{new_text}'")
+                except Exception as e1:
+                    logger.debug(f"캡션 수정 실패 (텍스트로 재시도): {e1}")
+                # 캡션 수정 실패 시 텍스트 수정 시도
+                if not edited:
+                    try:
                         await context.bot.edit_message_text(
                             chat_id=message.chat_id,
                             message_id=message.message_id,
                             text=new_text,
                         )
-                    logger.info(f"추가사진 메시지 주소 추가 성공: '{new_text}'")
-                except Exception as e:
-                    logger.error(f"추가사진 메시지 수정 실패: {e}")
+                        logger.info(f"추가사진 텍스트 수정 성공: '{new_text}'")
+                    except Exception as e2:
+                        logger.error(
+                            f"추가사진 메시지 수정 실패: caption={e1}, text={e2}"
+                        )
 
         return True
 
