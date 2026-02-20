@@ -3138,38 +3138,75 @@ class TelegramNotionBot:
         reply_to = group_data.get("reply_to_message")
         chat_id = message.chat_id
 
-        # ── 답장 앨범인 경우 추가사진 여부 확인 ──
-        if reply_to and context:
-            handled = await self._handle_extra_photo_reply(
-                message, context, photo_urls, caption,
-                reply_message=reply_to,  # group_data에서 확실히 꺼낸 reply_to 전달
-            )
-            if handled:
-                return
-            # 추가사진이 아닌 답장 앨범 → 무시 (일반 채팅 답장 등)
+        logger.debug(
+            f"_process_media_group: chat={chat_id}, "
+            f"photos={len(photo_urls)}, caption={caption!r}, "
+            f"reply_to={reply_to.message_id if reply_to else None}"
+        )
+
+        # ── ① 추가사진 캡션 우선 처리 (reply_to 여부와 무관하게 먼저 확인) ──
+        is_extra, extra_label = self._is_extra_photo_caption(caption or "")
+
+        if is_extra:
+            if reply_to and context:
+                # 정상 케이스: 원본 메시지에 답장하면서 추가사진 캡션
+                handled = await self._handle_extra_photo_reply(
+                    message, context, photo_urls, caption,
+                    reply_message=reply_to,
+                )
+                if handled:
+                    return
+            elif context:
+                # reply_to 없이 추가사진 캡션 → 안내 메시지 전송
+                logger.warning(
+                    f"추가사진 캡션이지만 reply_to 없음: chat={chat_id}"
+                )
+                try:
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=(
+                            "⚠️ 추가사진을 저장하려면 원본 매물 메시지에 "
+                            "**답장(Reply)**하여 사진을 보내주세요.\n\n"
+                            "📌 방법: 매물 설명 메시지를 길게 눌러 → '답장' 선택 → 사진 첨부 → 캡션에 '추가사진' 입력"
+                        ),
+                    )
+                except Exception as e:
+                    logger.warning(f"추가사진 안내 메시지 전송 실패: {e}")
             return
 
-        # ── 답장 없는 앨범이지만, 이 채팅의 추가사진 버퍼가 활성화된 경우 ──
-        # (10장 초과 시 Telegram이 2개 이상의 앨범으로 분리 전송하는데
-        #  두 번째 앨범에 reply_to_message가 없을 수 있음)
+        # ── ② 답장 앨범 (추가사진 캡션 아님) ──
+        if reply_to and context:
+            # 이미 버퍼에 있는 원본 메시지에 대한 추가 앨범인지 확인
+            already_in_buffer = reply_to.message_id in self._extra_photo_buffers
+            if already_in_buffer:
+                handled = await self._handle_extra_photo_reply(
+                    message, context, photo_urls, caption,
+                    reply_message=reply_to,
+                )
+                if handled:
+                    return
+            # 추가사진도 아니고 버퍼도 없는 답장 앨범 → 무시
+            return
+
+        # ── ③ 답장 없는 앨범 + 이 채팅에 활성 추가사진 버퍼 있음 ──
+        # (10장 초과 시 Telegram이 2개 이상 앨범으로 분리, 2번째 앨범에 reply_to 없을 수 있음)
         if context:
             active_buf = self._find_active_extra_buffer(chat_id)
             if active_buf is not None:
                 orig_msg_id, buf_data = active_buf
                 buf_data["photos"].extend(photo_urls)
-                # 30초 타이머 리셋
                 if buf_data.get("timer_task"):
                     buf_data["timer_task"].cancel()
                 buf_data["timer_task"] = asyncio.create_task(
                     self._do_save_extra_photos(orig_msg_id, context.bot)
                 )
                 logger.info(
-                    f"추가사진 2차 앨범 자동 연결: chat_id={chat_id}, "
+                    f"추가사진 2차 앨범 자동 연결: chat={chat_id}, "
                     f"{len(photo_urls)}장 → orig_msg={orig_msg_id}"
                 )
                 return
 
-        # 사진을 채팅 버퍼에 추가 (복수 미디어그룹 묶음 처리)
+        # ── ④ 일반 매물 사진 ──
         self._add_photos_to_buffer(chat_id, photo_urls, message, author_sig)
 
         # 캡션이 매물 형식(1. 2. 3...)이면 → 30초 후 저장 예약
@@ -3512,9 +3549,18 @@ class TelegramNotionBot:
         """
         reply = reply_message or message.reply_to_message
         if not reply:
+            # reply_to 없는 경우 - 로그만 남기고 False 반환
+            logger.debug(
+                f"_handle_extra_photo_reply: reply_to 없음 "
+                f"(caption={caption!r})"
+            )
             return False
 
         orig_msg_id = reply.message_id
+        logger.debug(
+            f"_handle_extra_photo_reply: orig_msg_id={orig_msg_id}, "
+            f"caption={caption!r}, photos={len(photo_urls)}"
+        )
         cap = caption or message.caption or ""
 
         is_extra, extra_label = self._is_extra_photo_caption(cap)
