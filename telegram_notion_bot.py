@@ -3682,12 +3682,14 @@ class TelegramNotionBot:
                 f"{len(pending)}장 추가"
             )
 
-        # 기존 타이머 취소 후 30초 재시작
-        if buf.get("timer_task"):
-            buf["timer_task"].cancel()
-        buf["timer_task"] = asyncio.create_task(
-            self._do_save_extra_photos(orig_msg_id, bot)
-        )
+        # 사진이 있을 때만 30초 타이머 시작/리셋
+        # (텍스트 "추가사진"만 먼저 오면 사진 도착 전 버퍼 사라지는 것 방지)
+        if buf["photos"]:
+            if buf.get("timer_task"):
+                buf["timer_task"].cancel()
+            buf["timer_task"] = asyncio.create_task(
+                self._do_save_extra_photos(orig_msg_id, bot)
+            )
 
     async def _do_save_extra_photos(
         self, orig_msg_id: int, bot
@@ -3753,14 +3755,42 @@ class TelegramNotionBot:
         if not text:
             return
 
-        # 텍스트 답장: 거래완료/계약완료 패턴만 처리, 나머지 무시
-        # (예: "월세 조정됐습니다" 같은 알림성 답장은 노션에 저장하지 않음)
+        # 텍스트 답장 처리
         if message.reply_to_message:
+            # ① 거래완료/계약완료 패턴 처리
             is_deal, agent = self._parse_deal_complete(text)
             if is_deal:
                 await self._handle_deal_complete_reply(
                     message, context, agent
                 )
+                return
+
+            # ② 추가사진 텍스트 답장: 뒤따라오는 사진 앨범을 받기 위한 버퍼 생성
+            is_extra, extra_label = self._is_extra_photo_caption(text)
+            if is_extra:
+                orig_msg_id = message.reply_to_message.message_id
+                page_id = await self._get_extra_photo_page_id(
+                    orig_msg_id,
+                    reply_message=message.reply_to_message,
+                )
+                if page_id:
+                    label = extra_label or "추가사진"
+                    await self._schedule_extra_photo_save(
+                        orig_msg_id, [], label, page_id, context.bot,
+                        chat_id=message.chat_id,
+                    )
+                    logger.info(
+                        f"추가사진 텍스트 답장 감지 → 사진 대기 버퍼 생성: "
+                        f"orig_msg={orig_msg_id}, label={label}"
+                    )
+                else:
+                    logger.warning(
+                        f"추가사진 텍스트 답장: 노션 페이지 못 찾음 "
+                        f"(orig_msg={orig_msg_id})"
+                    )
+                return
+
+            # 나머지 텍스트 답장 무시 (예: "월세 조정됐습니다")
             return
 
         # ── 매물 설명인지 확인 (1. 2. 3... 번호 형식) ──
