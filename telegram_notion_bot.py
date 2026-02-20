@@ -3769,7 +3769,7 @@ class TelegramNotionBot:
             is_extra, extra_label = self._is_extra_photo_caption(text)
             if is_extra:
                 orig_msg_id = message.reply_to_message.message_id
-                page_id = await self._get_extra_photo_page_id(
+                page_id = self._get_extra_photo_page_id(
                     orig_msg_id,
                     reply_message=message.reply_to_message,
                 )
