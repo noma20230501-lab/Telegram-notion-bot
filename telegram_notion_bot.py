@@ -3672,7 +3672,7 @@ class TelegramNotionBot:
                 address = self._get_address_from_message(reply)
             if address:
                 cap = caption or message.caption or message.text or ""
-                new_text = f"{address}\n{cap.strip()}"
+                new_text = f"{address} {cap.strip()}"
                 edited = False
                 # 캡션 수정 시도 (사진 앨범인 경우)
                 try:
