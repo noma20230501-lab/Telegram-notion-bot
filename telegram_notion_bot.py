@@ -3056,6 +3056,26 @@ class TelegramNotionBot:
             # 추가사진이 아닌 답장 앨범 → 무시 (일반 채팅 답장 등)
             return
 
+        # ── 답장 없는 앨범이지만, 이 채팅의 추가사진 버퍼가 활성화된 경우 ──
+        # (10장 초과 시 Telegram이 2개 이상의 앨범으로 분리 전송하는데
+        #  두 번째 앨범에 reply_to_message가 없을 수 있음)
+        if context:
+            active_buf = self._find_active_extra_buffer(chat_id)
+            if active_buf is not None:
+                orig_msg_id, buf_data = active_buf
+                buf_data["photos"].extend(photo_urls)
+                # 30초 타이머 리셋
+                if buf_data.get("timer_task"):
+                    buf_data["timer_task"].cancel()
+                buf_data["timer_task"] = asyncio.create_task(
+                    self._do_save_extra_photos(orig_msg_id, context.bot)
+                )
+                logger.info(
+                    f"추가사진 2차 앨범 자동 연결: chat_id={chat_id}, "
+                    f"{len(photo_urls)}장 → orig_msg={orig_msg_id}"
+                )
+                return
+
         # 사진을 채팅 버퍼에 추가 (복수 미디어그룹 묶음 처리)
         self._add_photos_to_buffer(chat_id, photo_urls, message, author_sig)
 
@@ -3407,7 +3427,23 @@ class TelegramNotionBot:
         is_extra, extra_label = self._is_extra_photo_caption(cap)
         already_in_buffer = orig_msg_id in self._extra_photo_buffers
 
-        if not (is_extra or already_in_buffer):
+        # 타이밍 문제 대비: orig_msg_id 버퍼는 없지만,
+        # 같은 채팅에 활성화된 추가사진 버퍼가 있으면 그쪽에 연결
+        if not is_extra and not already_in_buffer:
+            chat_active = self._find_active_extra_buffer(message.chat_id)
+            if chat_active is not None:
+                active_orig_id, buf_data = chat_active
+                buf_data["photos"].extend(photo_urls)
+                if buf_data.get("timer_task"):
+                    buf_data["timer_task"].cancel()
+                buf_data["timer_task"] = asyncio.create_task(
+                    self._do_save_extra_photos(active_orig_id, context.bot)
+                )
+                logger.info(
+                    f"추가사진 타이밍 보완: chat 활성버퍼({active_orig_id})에 "
+                    f"{len(photo_urls)}장 추가"
+                )
+                return True
             # 추가사진 캡션도 없고 기존 버퍼도 없음 → 무시
             return False
 
@@ -3436,13 +3472,25 @@ class TelegramNotionBot:
         )
 
         await self._schedule_extra_photo_save(
-            orig_msg_id, photo_urls, label, page_id, context.bot
+            orig_msg_id, photo_urls, label, page_id, context.bot,
+            chat_id=message.chat_id,
         )
         logger.info(
             f"추가사진 버퍼 추가: orig_msg={orig_msg_id}, "
             f"{len(photo_urls)}장, 라벨={label}"
         )
         return True
+
+    def _find_active_extra_buffer(self, chat_id: int):
+        """주어진 chat_id에 대해 활성화된 추가사진 버퍼를 반환.
+
+        Returns:
+            (orig_msg_id, buf_data) 튜플 또는 None
+        """
+        for orig_msg_id, buf_data in self._extra_photo_buffers.items():
+            if buf_data.get("chat_id") == chat_id:
+                return orig_msg_id, buf_data
+        return None
 
     async def _schedule_extra_photo_save(
         self,
@@ -3451,6 +3499,7 @@ class TelegramNotionBot:
         label: str,
         page_id: str,
         bot,
+        chat_id: int = None,
     ):
         """추가사진 버퍼에 사진 추가 + 30초 타이머 리셋"""
         if orig_msg_id not in self._extra_photo_buffers:
@@ -3458,6 +3507,7 @@ class TelegramNotionBot:
                 "photos": [],
                 "label": label,
                 "page_id": page_id,
+                "chat_id": chat_id,   # 두 번째 앨범 연결용
                 "timer_task": None,
             }
 
