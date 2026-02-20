@@ -1785,6 +1785,10 @@ class TelegramNotionBot:
         # 추가사진 버퍼: {orig_msg_id: {"photos": [], "label": str, "page_id": str, "timer_task": Task}}
         self._extra_photo_buffers: Dict[int, Dict] = {}
 
+        # 매핑 파일 (봇 재시작 후에도 page_mapping 유지)
+        self._mapping_file = "page_mapping.json"
+        self._load_page_mapping()
+
         # 매물접수자 이름 목록 (노션 셀렉트 옵션과 일치해야 함)
         self._staff_names = [
             "박진우", "김동영", "임정묵",
@@ -2269,11 +2273,46 @@ class TelegramNotionBot:
             except Exception:
                 pass
 
+    # ──────────────────────────────────────────────
+    # 매핑 파일 저장/로드 (재시작 후에도 page_mapping 유지)
+    # ──────────────────────────────────────────────
+
+    def _load_page_mapping(self):
+        """파일에서 page_mapping 로드"""
+        import json as _json
+        try:
+            with open(self._mapping_file, "r", encoding="utf-8") as f:
+                data = _json.load(f)
+            # JSON key는 str → int로 변환
+            self._page_mapping = {int(k): v for k, v in data.items()}
+            logger.info(f"page_mapping 로드 완료: {len(self._page_mapping)}개")
+        except FileNotFoundError:
+            logger.info("page_mapping 파일 없음, 빈 상태로 시작")
+        except Exception as e:
+            logger.warning(f"page_mapping 로드 실패: {e}")
+
+    def _save_page_mapping(self):
+        """page_mapping을 파일에 저장"""
+        import json as _json
+        try:
+            with open(self._mapping_file, "w", encoding="utf-8") as f:
+                _json.dump(
+                    {str(k): v for k, v in self._page_mapping.items()},
+                    f, ensure_ascii=False, indent=2,
+                )
+        except Exception as e:
+            logger.warning(f"page_mapping 저장 실패: {e}")
+
     def _get_page_id_from_reply(
         self, reply_message
     ) -> Optional[str]:
         """답장 대상 메시지에서 노션 페이지 ID 추출
-        (원본 매물 게시물 지원)
+
+        탐색 순서:
+          1. 메모리 매핑 (_page_mapping)
+          2. 메시지 entities의 Notion text_link URL
+          3. 노션 DB에서 telegram_msg_id로 검색
+          4. 메시지 첫 줄(주소)로 노션 DB 검색 (최종 폴백)
         """
         msg_id = reply_message.message_id
 
@@ -2281,13 +2320,7 @@ class TelegramNotionBot:
         if msg_id in self._page_mapping:
             return self._page_mapping[msg_id]
 
-        # 2. 텍스트 또는 entities에서 Notion URL 추출
-        text = reply_message.text or reply_message.caption or ""
-        notion_url = ""
-        if "notion.so" in text:
-            notion_url = text
-        
-        # HTML 하이퍼링크에서 URL 추출
+        # 2. HTML 하이퍼링크 entities에서 Notion URL 추출
         entities = (
             reply_message.entities
             or reply_message.caption_entities
@@ -2295,11 +2328,24 @@ class TelegramNotionBot:
         )
         for ent in entities:
             if ent.type == "text_link" and ent.url and "notion.so" in ent.url:
-                notion_url = ent.url
-                break
-        
-        if notion_url:
-            match = re.search(r'([a-f0-9]{32})', notion_url)
+                match = re.search(r'([a-f0-9]{32})', ent.url)
+                if match:
+                    raw_id = match.group(1)
+                    page_id = (
+                        f"{raw_id[:8]}-{raw_id[8:12]}"
+                        f"-{raw_id[12:16]}"
+                        f"-{raw_id[16:20]}-{raw_id[20:]}"
+                    )
+                    # 캐시에 저장
+                    self._page_mapping[msg_id] = page_id
+                    self._save_page_mapping()
+                    logger.info(f"entities에서 page_id 복구: msg_id={msg_id}")
+                    return page_id
+
+        # 3. 텍스트에 직접 Notion URL이 포함된 경우 (plain text 폴백)
+        text = reply_message.text or reply_message.caption or ""
+        if "notion.so" in text:
+            match = re.search(r'notion\.so/[^\s]*?([a-f0-9]{32})', text)
             if match:
                 raw_id = match.group(1)
                 page_id = (
@@ -2307,7 +2353,46 @@ class TelegramNotionBot:
                     f"-{raw_id[12:16]}"
                     f"-{raw_id[16:20]}-{raw_id[20:]}"
                 )
+                self._page_mapping[msg_id] = page_id
+                self._save_page_mapping()
                 return page_id
+
+        # 4. Notion DB에서 telegram_msg_id로 검색
+        page_id = self.notion_uploader.find_page_by_msg_id(msg_id)
+        if page_id:
+            self._page_mapping[msg_id] = page_id
+            self._save_page_mapping()
+            logger.info(f"Notion DB msg_id 검색으로 page_id 복구: msg_id={msg_id}")
+            return page_id
+
+        # 5. 메시지 첫 줄(주소)로 Notion DB 검색 (최종 폴백)
+        #    봇 재시작 후 reply_to_message에 entities 없을 때도 동작
+        if text:
+            # DIVIDER 이전 내용만 사용 (노션 링크 섹션 제거)
+            content = text.split(self.DIVIDER)[0].strip()
+            first_line = content.split("\n")[0].strip()
+            # 너무 짧거나 명령어이면 스킵
+            if len(first_line) >= 5 and not first_line.startswith("/"):
+                pages = self.notion_uploader.find_pages_by_address(first_line)
+                if len(pages) == 1:
+                    page_id = pages[0]["page_id"]
+                    self._page_mapping[msg_id] = page_id
+                    self._save_page_mapping()
+                    logger.info(
+                        f"주소 검색으로 page_id 복구: "
+                        f"'{first_line}' → {page_id}"
+                    )
+                    return page_id
+                elif len(pages) > 1:
+                    # 여러 개 히트: 가장 최근 것 선택 (Notion 기본 정렬: 생성 역순)
+                    page_id = pages[0]["page_id"]
+                    self._page_mapping[msg_id] = page_id
+                    self._save_page_mapping()
+                    logger.info(
+                        f"주소 검색 복수 결과, 최신 사용: "
+                        f"'{first_line}' → {page_id} (총 {len(pages)}개)"
+                    )
+                    return page_id
 
         return None
 
@@ -2867,6 +2952,8 @@ class TelegramNotionBot:
                 logger.debug(
                     f"첫 사진 메시지 매핑 저장: msg_id={first_photo_msg.message_id} → page_id={page_id}"
                 )
+            # 파일에 저장 (봇 재시작 후에도 유지)
+            self._save_page_mapping()
 
             # 원본 메시지에 노션 링크 추가
             notion_html = self._build_notion_section(
