@@ -1535,6 +1535,18 @@ class NotionUploader:
             logger.error(f"주소 검색 실패: {e}")
             return []
 
+    def get_page_address(self, page_id: str) -> Optional[str]:
+        """노션 페이지의 '주소 및 상호' title 속성을 반환"""
+        try:
+            page = self.client.pages.retrieve(page_id=page_id)
+            props = page.get("properties", {})
+            title_arr = props.get("주소 및 상호", {}).get("title", [])
+            if title_arr:
+                return title_arr[0].get("text", {}).get("content", "")
+        except Exception as e:
+            logger.warning(f"노션 주소 조회 실패 (page_id={page_id}): {e}")
+        return None
+
     def get_page_properties(self, page_id: str) -> Dict:
         """노션 페이지의 현재 속성값을 파싱하여 반환"""
         try:
@@ -3796,8 +3808,15 @@ class TelegramNotionBot:
                     # 원본 매물 주소를 앞에 붙여 메시지 텍스트 수정
                     # "추가사진" → "수성구 황금동 111-21 대대대 추가사진"
                     # → 채널에서 주소 검색 시 추가사진도 함께 검색됨
-                    address = self._get_address_from_message(
-                        message.reply_to_message
+                    # 노션에서 주소 가져오기 (가장 확실한 방법)
+                    address = self.notion_uploader.get_page_address(page_id)
+                    # 노션에서 못 가져오면 reply 메시지에서 추출 시도
+                    if not address:
+                        address = self._get_address_from_message(
+                            message.reply_to_message
+                        )
+                    logger.info(
+                        f"추가사진 주소: {address!r} (page_id={page_id})"
                     )
                     if address:
                         new_text = f"{address} {text.strip()}"
@@ -3808,11 +3827,12 @@ class TelegramNotionBot:
                                 text=new_text,
                             )
                             logger.info(
-                                f"추가사진 메시지 텍스트 수정: '{new_text}'"
+                                f"추가사진 메시지 수정 성공: '{new_text}'"
                             )
                         except Exception as e:
-                            logger.warning(
-                                f"추가사진 메시지 수정 실패 (권한 문제일 수 있음): {e}"
+                            logger.error(
+                                f"추가사진 메시지 수정 실패: {e} "
+                                f"(chat={message.chat_id}, msg={message.message_id})"
                             )
                     logger.info(
                         f"추가사진 텍스트 답장 감지 → 사진 대기 버퍼 생성: "
