@@ -1788,6 +1788,9 @@ class TelegramNotionBot:
         # 매핑 파일 (봇 재시작 후에도 page_mapping 유지)
         self._mapping_file = "page_mapping.json"
         self._load_page_mapping()
+        # 10장 초과 시 2번째 앨범이 1번째보다 먼저 도착하는 경우 대기
+        # {orig_msg_id: [photo_url, photo_url, ...]}
+        self._pending_reply_photos: Dict[int, List[str]] = {}
 
         # 매물접수자 이름 목록 (노션 셀렉트 옵션과 일치해야 함)
         self._staff_names = [
@@ -3157,35 +3160,50 @@ class TelegramNotionBot:
                 if handled:
                     return
             elif context:
-                # reply_to 없이 추가사진 캡션 → 안내 메시지 전송
+                # reply_to 없이 추가사진 캡션 → 로그만
                 logger.warning(
-                    f"추가사진 캡션이지만 reply_to 없음: chat={chat_id}"
+                    f"추가사진 캡션이지만 reply_to 없음: chat={chat_id}, "
+                    f"photos={len(photo_urls)}장"
                 )
-                try:
-                    await context.bot.send_message(
-                        chat_id=chat_id,
-                        text=(
-                            "⚠️ 추가사진을 저장하려면 원본 매물 메시지에 "
-                            "**답장(Reply)**하여 사진을 보내주세요.\n\n"
-                            "📌 방법: 매물 설명 메시지를 길게 눌러 → '답장' 선택 → 사진 첨부 → 캡션에 '추가사진' 입력"
-                        ),
+                # 이 채팅에 활성 추가사진 버퍼가 있으면 거기에 합류
+                active_buf = self._find_active_extra_buffer(chat_id)
+                if active_buf is not None:
+                    orig_msg_id_found, buf_data = active_buf
+                    buf_data["photos"].extend(photo_urls)
+                    if buf_data.get("timer_task"):
+                        buf_data["timer_task"].cancel()
+                    buf_data["timer_task"] = asyncio.create_task(
+                        self._do_save_extra_photos(
+                            orig_msg_id_found, context.bot
+                        )
                     )
-                except Exception as e:
-                    logger.warning(f"추가사진 안내 메시지 전송 실패: {e}")
+                    logger.info(
+                        f"추가사진(reply없음) → 활성 버퍼 합류: "
+                        f"orig={orig_msg_id_found}, {len(photo_urls)}장"
+                    )
             return
 
         # ── ② 답장 앨범 (추가사진 캡션 아님) ──
         if reply_to and context:
+            orig_id = reply_to.message_id
             # 이미 버퍼에 있는 원본 메시지에 대한 추가 앨범인지 확인
-            already_in_buffer = reply_to.message_id in self._extra_photo_buffers
-            if already_in_buffer:
+            if orig_id in self._extra_photo_buffers:
                 handled = await self._handle_extra_photo_reply(
                     message, context, photo_urls, caption,
                     reply_message=reply_to,
                 )
                 if handled:
                     return
-            # 추가사진도 아니고 버퍼도 없는 답장 앨범 → 무시
+            else:
+                # 버퍼 아직 없음: 2번째 앨범이 1번째보다 먼저 도착한 경우
+                # → 대기목록에 사진 저장 (1번째 앨범이 버퍼 만들 때 합류)
+                self._pending_reply_photos.setdefault(orig_id, []).extend(
+                    photo_urls
+                )
+                logger.info(
+                    f"추가사진 대기목록 저장: orig_msg={orig_id}, "
+                    f"{len(photo_urls)}장 (캡션 있는 앨범 대기중)"
+                )
             return
 
         # ── ③ 답장 없는 앨범 + 이 채팅에 활성 추가사진 버퍼 있음 ──
@@ -3610,22 +3628,10 @@ class TelegramNotionBot:
             ).get("label", "추가사진")
         )
 
-        is_new_buffer = orig_msg_id not in self._extra_photo_buffers
         await self._schedule_extra_photo_save(
             orig_msg_id, photo_urls, label, page_id, context.bot,
             chat_id=message.chat_id,
-            ack_chat_id=message.chat_id,
-            ack_msg_id=message.message_id,
         )
-        # 처음 추가사진을 인식했을 때만 즉각 피드백
-        if is_new_buffer:
-            try:
-                await message.reply_text(
-                    f"📷 추가사진 인식됨! 30초 후 노션에 저장합니다.\n"
-                    f"(추가 사진이 있으면 30초 내에 같이 올려주세요)"
-                )
-            except Exception:
-                pass
         logger.info(
             f"추가사진 버퍼 추가: orig_msg={orig_msg_id}, "
             f"{len(photo_urls)}장, 라벨={label}"
@@ -3651,8 +3657,6 @@ class TelegramNotionBot:
         page_id: str,
         bot,
         chat_id: int = None,
-        ack_chat_id: int = None,
-        ack_msg_id: int = None,
     ):
         """추가사진 버퍼에 사진 추가 + 30초 타이머 리셋"""
         if orig_msg_id not in self._extra_photo_buffers:
@@ -3661,9 +3665,6 @@ class TelegramNotionBot:
                 "label": label,
                 "page_id": page_id,
                 "chat_id": chat_id,        # 두 번째 앨범 연결용
-                "ack_chat_id": ack_chat_id,  # 완료 알림 보낼 채팅 ID
-                "ack_msg_id": ack_msg_id,    # 완료 알림 답장 대상 메시지 ID
-                "bot": bot,
                 "timer_task": None,
             }
 
@@ -3671,6 +3672,15 @@ class TelegramNotionBot:
         buf["photos"].extend(photos)
         if label:
             buf["label"] = label  # 새 라벨로 업데이트
+
+        # 대기목록에 있던 사진들 합류 (2번째 앨범이 먼저 도착한 경우)
+        pending = self._pending_reply_photos.pop(orig_msg_id, [])
+        if pending:
+            buf["photos"].extend(pending)
+            logger.info(
+                f"추가사진 대기목록 합류: orig_msg={orig_msg_id}, "
+                f"{len(pending)}장 추가"
+            )
 
         # 기존 타이머 취소 후 30초 재시작
         if buf.get("timer_task"):
@@ -3692,9 +3702,6 @@ class TelegramNotionBot:
         photos = buf.get("photos", [])
         label = buf.get("label", "추가사진")
         page_id = buf.get("page_id")
-        ack_chat_id = buf.get("ack_chat_id")
-        ack_msg_id = buf.get("ack_msg_id")
-        saved_bot = buf.get("bot") or bot
 
         if not photos or not page_id:
             return
@@ -3727,28 +3734,8 @@ class TelegramNotionBot:
                 f"추가사진 저장 완료: page_id={page_id}, "
                 f"{len(photos)}장, 라벨={full_label}"
             )
-            # 완료 알림
-            if ack_chat_id and saved_bot:
-                try:
-                    await saved_bot.send_message(
-                        chat_id=ack_chat_id,
-                        text=f"✅ 추가사진 {len(photos)}장 노션 저장 완료!\n"
-                             f"라벨: 📷 {full_label}",
-                        reply_to_message_id=ack_msg_id,
-                    )
-                except Exception as e:
-                    logger.warning(f"추가사진 완료 알림 전송 실패: {e}")
         else:
             logger.error(f"추가사진 저장 실패: page_id={page_id}")
-            if ack_chat_id and saved_bot:
-                try:
-                    await saved_bot.send_message(
-                        chat_id=ack_chat_id,
-                        text="❌ 추가사진 노션 저장 중 오류가 발생했습니다.",
-                        reply_to_message_id=ack_msg_id,
-                    )
-                except Exception:
-                    pass
 
     async def handle_text_message(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
