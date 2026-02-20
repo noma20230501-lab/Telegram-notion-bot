@@ -3654,6 +3654,7 @@ class TelegramNotionBot:
             ).get("label", "추가사진")
         )
 
+        is_new_buffer = orig_msg_id not in self._extra_photo_buffers
         await self._schedule_extra_photo_save(
             orig_msg_id, photo_urls, label, page_id, context.bot,
             chat_id=message.chat_id,
@@ -3662,6 +3663,35 @@ class TelegramNotionBot:
             f"추가사진 버퍼 추가: orig_msg={orig_msg_id}, "
             f"{len(photo_urls)}장, 라벨={label}"
         )
+
+        # 첫 추가사진 인식 시 → 메시지에 주소 추가
+        # (사진 캡션이든 텍스트든 주소를 앞에 붙여줌)
+        if is_new_buffer and is_extra:
+            address = self.notion_uploader.get_page_address(page_id)
+            if not address:
+                address = self._get_address_from_message(reply)
+            if address:
+                cap = caption or message.caption or message.text or ""
+                new_text = f"{address}\n{cap.strip()}"
+                try:
+                    if message.photo:
+                        # 사진 메시지 → 캡션 수정
+                        await context.bot.edit_message_caption(
+                            chat_id=message.chat_id,
+                            message_id=message.message_id,
+                            caption=new_text,
+                        )
+                    else:
+                        # 텍스트 메시지 → 텍스트 수정
+                        await context.bot.edit_message_text(
+                            chat_id=message.chat_id,
+                            message_id=message.message_id,
+                            text=new_text,
+                        )
+                    logger.info(f"추가사진 메시지 주소 추가 성공: '{new_text}'")
+                except Exception as e:
+                    logger.error(f"추가사진 메시지 수정 실패: {e}")
+
         return True
 
     def _find_active_extra_buffer(self, chat_id: int):
