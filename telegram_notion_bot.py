@@ -3500,6 +3500,20 @@ class TelegramNotionBot:
     # ──────────────────────────────────────────────
 
     @staticmethod
+    def _get_address_from_message(msg) -> Optional[str]:
+        """메시지(원본 매물)에서 주소(첫 번째 줄) 추출"""
+        if not msg:
+            return None
+        content = msg.text or msg.caption or ""
+        if not content:
+            return None
+        first_line = content.strip().split("\n")[0].strip()
+        # 너무 짧거나 숫자만 있으면 주소가 아님
+        if len(first_line) < 4:
+            return None
+        return first_line
+
+    @staticmethod
     def _is_extra_photo_caption(caption: str) -> Tuple[bool, str]:
         """추가사진 캡션 감지 및 라벨 추출
 
@@ -3779,6 +3793,27 @@ class TelegramNotionBot:
                         orig_msg_id, [], label, page_id, context.bot,
                         chat_id=message.chat_id,
                     )
+                    # 원본 매물 주소를 앞에 붙여 메시지 텍스트 수정
+                    # "추가사진" → "수성구 황금동 111-21 대대대 추가사진"
+                    # → 채널에서 주소 검색 시 추가사진도 함께 검색됨
+                    address = self._get_address_from_message(
+                        message.reply_to_message
+                    )
+                    if address:
+                        new_text = f"{address} {text.strip()}"
+                        try:
+                            await context.bot.edit_message_text(
+                                chat_id=message.chat_id,
+                                message_id=message.message_id,
+                                text=new_text,
+                            )
+                            logger.info(
+                                f"추가사진 메시지 텍스트 수정: '{new_text}'"
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                f"추가사진 메시지 수정 실패 (권한 문제일 수 있음): {e}"
+                            )
                     logger.info(
                         f"추가사진 텍스트 답장 감지 → 사진 대기 버퍼 생성: "
                         f"orig_msg={orig_msg_id}, label={label}"
