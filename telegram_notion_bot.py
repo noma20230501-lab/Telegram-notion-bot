@@ -2032,7 +2032,7 @@ class TelegramNotionBot:
     async def _finalize_features(
         self, chat_id: int, bot
     ):
-        """상가 특징 선택 확정 → 키보드 삭제 + 결과 텍스트 전송"""
+        """상가 특징 선택 확정 → 키보드 삭제 (결과는 원본 메시지에 병합)"""
         selection = self._feature_selections.get(chat_id)
         if not selection or selection.get("finalized"):
             return
@@ -2049,7 +2049,8 @@ class TelegramNotionBot:
                     f"상가 특징 키보드 삭제 실패: {e}"
                 )
 
-        # 결과 텍스트 전송
+        # 결과 텍스트는 별도 메시지로 보내지 않음
+        # → _do_save_with_buffer에서 원본 메시지(description)에 병합
         features = self._get_feature_texts(
             selection["selected"]
         )
@@ -2058,16 +2059,9 @@ class TelegramNotionBot:
         else:
             result_text = "9. 해당없음"
 
-        try:
-            await bot.send_message(chat_id, result_text)
-        except Exception as e:
-            logger.warning(
-                f"상가 특징 결과 텍스트 전송 실패: {e}"
-            )
-
         logger.info(
             f"상가 특징 확정: chat_id={chat_id}, "
-            f"결과='{result_text}'"
+            f"결과='{result_text}' (원본 메시지에 병합 예정)"
         )
 
     @staticmethod
@@ -2418,6 +2412,12 @@ class TelegramNotionBot:
             extra_features = self._get_feature_texts(
                 selection["selected"]
             )
+
+        # 상가 특징 선택 결과를 원본 description에 병합
+        # → 원본 메시지 수정 시 8번 밑에 자연스럽게 9번 표시
+        if extra_features:
+            line9 = "9. " + ", ".join(extra_features)
+            description = description.rstrip() + "\n" + line9
 
         # 버퍼에서 사진 & 층별 그룹 가져오기
         buf = self._chat_buffers.get(chat_id, {})
