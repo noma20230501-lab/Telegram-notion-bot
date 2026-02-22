@@ -1486,10 +1486,32 @@ class NotionUploader:
             logger.error(f"msg_id 검색 실패: {e}")
             return None
 
+    @staticmethod
+    def _extract_location_key(address: str) -> str:
+        """주소에서 '번지+층수'까지만 추출 (상호명 제외)
+
+        예) "수성구 수성동4가 1009-26 1층 이치부타이" → "수성구 수성동4가 1009-26 1층"
+            "수성구 수성동4가 1009-26 1층 일부 독도부동산" → "수성구 수성동4가 1009-26 1층 일부"
+        층 표기가 없으면 원본 주소를 그대로 반환.
+        """
+        # 괄호 제거
+        addr = re.split(r'[\(（]', address)[0].strip()
+        # "[숫자]층" 뒤에 "일부" 가 오면 "일부"까지, 아니면 층까지만
+        m = re.search(
+            r'(\d+\s*층(?:\s*일부)?)',
+            addr,
+        )
+        if m:
+            end = m.end()
+            return addr[:end].strip()
+        return addr
+
     def find_pages_by_address(
         self, address: str, exclude_page_id: str = None
     ) -> List[Dict]:
         """주소로 노션 페이지 검색 (동일 주소 중복 감지용)
+
+        번지+층수가 같으면 상호명이 달라도 동일 매물로 취급.
 
         Args:
             address: 검색할 주소 문자열
@@ -1499,10 +1521,13 @@ class NotionUploader:
             [{"page_id": str, "title": str, "url": str}, ...]
         """
         try:
-            # 괄호 부분 제거 후 핵심 주소만 사용 (너무 짧으면 오탐 방지)
-            clean_addr = address.split("(")[0].strip()
-            if len(clean_addr) < 5:
+            # 층수까지만 추출하여 비교 키로 사용
+            location_key = self._extract_location_key(address)
+            # 너무 짧으면 오탐 방지
+            if len(location_key) < 5:
                 return []
+            # 노션 검색은 location_key로 (contains 필터)
+            clean_addr = location_key
 
             results = []
             has_more = True
@@ -1544,6 +1569,13 @@ class NotionUploader:
                         if title_list
                         else ""
                     )
+
+                    # 노션에 저장된 주소도 층수까지만 추출해서 비교
+                    # → 상호가 달라도 번지+층수 같으면 중복 감지
+                    stored_key = self._extract_location_key(title)
+                    if location_key not in stored_key and stored_key not in location_key:
+                        continue
+
                     results.append(
                         {
                             "page_id": pid,
@@ -1909,6 +1941,56 @@ class TelegramNotionBot:
         return sig_norm[:30] if sig_norm else None
 
     # ──────────────────────────────────────────────
+    # 매물 텍스트 재정렬
+    # ──────────────────────────────────────────────
+
+    @staticmethod
+    def _reorder_section9(description: str) -> str:
+        """9번 항목을 8번 바로 아래로 이동 (사이에 특이사항이 껴 있어도)
+
+        Before:
+            8. 양도인 010-...
+            임차인 연락안됨
+            건물주 착한사람입니다.
+            9. 채광좋음, 빨간벽돌
+
+        After:
+            8. 양도인 010-...
+            9. 채광좋음, 빨간벽돌
+            임차인 연락안됨
+            건물주 착한사람입니다.
+        """
+        lines = description.split('\n')
+
+        line8_idx = None
+        line9_idx = None
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if line8_idx is None and re.match(r'^8\.', stripped):
+                line8_idx = i
+            if line9_idx is None and re.match(r'^9\.', stripped):
+                line9_idx = i
+
+        # 9번이 없거나 이미 8번 바로 다음이면 그대로
+        if line9_idx is None or line8_idx is None:
+            return description
+        if line9_idx <= line8_idx + 1:
+            return description
+
+        # 8번과 9번 사이 줄(특이사항)과 9번 줄을 분리
+        line9_content = lines[line9_idx]
+        between = lines[line8_idx + 1: line9_idx]   # 특이사항
+        rest    = lines[line9_idx + 1:]               # 9번 이후
+
+        new_lines = (
+            lines[:line8_idx + 1]   # 1~8번
+            + [line9_content]        # 9번 (8번 바로 아래)
+            + between                # 특이사항 (9번 아래로)
+            + rest
+        )
+        return '\n'.join(new_lines)
+
+    # ──────────────────────────────────────────────
     # 상가 특징 인라인 키보드 (9번 항목 자동 제안)
     # ──────────────────────────────────────────────
 
@@ -1980,7 +2062,6 @@ class TelegramNotionBot:
         query = update.callback_query
         if not query:
             return
-        await query.answer()
 
         chat_id = query.message.chat_id
         data = query.data
@@ -1988,6 +2069,7 @@ class TelegramNotionBot:
         selection = self._feature_selections.get(chat_id)
         if not selection or selection.get("finalized"):
             # 이미 완료되었거나 세션 없음
+            await query.answer()
             try:
                 await query.edit_message_text("⏰ 시간 초과 또는 이미 완료됨")
             except Exception:
@@ -1995,14 +2077,16 @@ class TelegramNotionBot:
             return
 
         if data == "feat_done":
-            # 완료 버튼 → 키보드 삭제, 결과 텍스트 전송
+            # 완료 버튼 → answer() 후 키보드 삭제
+            await query.answer()
             await self._finalize_features(chat_id, context.bot)
             return
 
-        # 토글: feat_0 ~ feat_5
+        # 토글: feat_0 ~ feat_5 (answer + 키보드 업데이트 병렬 처리)
         try:
             idx = int(data.replace("feat_", ""))
         except ValueError:
+            await query.answer()
             return
 
         if idx in selection["selected"]:
@@ -2010,13 +2094,15 @@ class TelegramNotionBot:
         else:
             selection["selected"].add(idx)
 
-        # 키보드 업데이트
+        # 키보드 업데이트 + answer() 를 병렬 처리 → round-trip 1회로 단축 (빠른 체크 반응)
         keyboard = self._build_feature_keyboard(
             selection["selected"]
         )
         try:
-            await query.edit_message_reply_markup(
-                reply_markup=keyboard
+            await asyncio.gather(
+                query.answer(),
+                query.edit_message_reply_markup(reply_markup=keyboard),
+                return_exceptions=True,
             )
         except Exception as e:
             logger.warning(f"키보드 업데이트 실패: {e}")
@@ -2214,7 +2300,7 @@ class TelegramNotionBot:
                 if isinstance(v, list):
                     return ", ".join(str(x) for x in v)
                 return str(v) if v is not None else ""
-
+            
             # 숫자 비교
             if isinstance(old_val, (int, float)) and isinstance(new_val, (int, float)):
                 if old_val != new_val:
@@ -3126,7 +3212,6 @@ class TelegramNotionBot:
             # 결과 알림 (명령어 메시지 삭제 실패 시에만 표시)
             if deleted_msg:
                 # 두 메시지 모두 삭제된 경우 → 알림 없이 깔끔하게 처리
-                # (만약 /delete 메시지 삭제 실패 시 아래 로그만 남김)
                 logger.info(
                     f"매물 삭제 완료: '{page_title}' "
                     f"(page_id={page_id})"
@@ -3171,6 +3256,9 @@ class TelegramNotionBot:
                           None이면 구분 없이 flat 표시
         """
         try:
+            # 9번 항목이 8번 바로 아래에 오도록 재정렬 (특이사항이 중간에 껴 있어도)
+            description = self._reorder_section9(description)
+
             property_data = self.parser.parse_property_info(description)
             property_data["원본 메시지"] = description
             property_data["telegram_chat_id"] = trigger_message.chat_id
