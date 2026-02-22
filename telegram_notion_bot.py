@@ -15,9 +15,10 @@ from typing import Dict, List, Optional, Tuple
 from pathlib import Path
 
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     MessageHandler,
     filters,
@@ -230,7 +231,7 @@ class PropertyParser:
                 
                 # 모든 층 정보를 저장할 딕셔너리 (층 번호를 키로 사용)
                 층별_정보 = {}
-
+                
                 # ── 면적 패턴 파싱 (다양한 입력 형식 통합 지원) ──
                 # 지원 형식:
                 #   1층 40/40          (기본)
@@ -251,7 +252,7 @@ class PropertyParser:
                     r'(\d+\.?\d*)',                  # 전용면적 숫자
                     content4
                 )
-
+                
                 for 층, 계약, 전용 in 면적_패턴:
                     계약_f = float(계약)
                     전용_f = float(전용)
@@ -261,7 +262,7 @@ class PropertyParser:
                         '전용': 전용_f,
                         '평': 평
                     }
-
+                
                 # 평수 명시 패턴 (예: "1층 계약48.43㎡ 전용48.43㎡ 14평")
                 # 위 패턴에서 못 잡은 경우만 추가 처리
                 상세_패턴 = re.findall(
@@ -271,7 +272,7 @@ class PropertyParser:
                     r'(?:약\s*)?(\d+\.?\d*)\s*평',
                     content4
                 )
-
+                
                 for 층, 계약, 전용, 평 in 상세_패턴:
                     if 층 not in 층별_정보:  # 위 패턴과 중복 방지
                         층별_정보[층] = {
@@ -490,6 +491,19 @@ class PropertyParser:
                         data, contact, contact_idx
                     )
                     contact_idx += 1
+
+            # 9. 상가 특징 (채광좋음, 전면넓음, 통창/통유리 등)
+            elif line.startswith("9."):
+                in_contacts = False
+                content9 = re.sub(r"^9\.\s*", "", line).strip()
+                if content9 and content9 != "해당없음":
+                    features = [
+                        f.strip()
+                        for f in re.split(r'[,，/]', content9)
+                        if f.strip()
+                    ]
+                    if features:
+                        data["상가_특징"] = features
 
             # 8번 이후 줄바꿈 추가 연락처
             elif in_contacts and not is_numbered:
@@ -783,6 +797,8 @@ class NotionUploader:
                     "거래완료 시점": {"rich_text": {}},
                     # 계약 담당자 (select)
                     "계약담당자": {"select": {}},
+                    # 상가 특징 (multi_select)
+                    "상가 특징": {"multi_select": {}},
                 },
             )
             logger.info("동기화용 Notion 속성 확인 완료")
@@ -988,6 +1004,18 @@ class NotionUploader:
             properties["🚨위반건축물"] = {
                 "select": {"name": property_data["위반건축물"]}
             }
+
+        # ── 상가 특징 (multi_select) ──
+        if "상가_특징" in property_data:
+            features = property_data["상가_특징"]
+            if isinstance(features, list):
+                properties["상가 특징"] = {
+                    "multi_select": [
+                        {"name": f[:100]}
+                        for f in features
+                        if f
+                    ]
+                }
 
         # ── 🙋🏻‍♂️매물접수 (multi_select) ──
         if "매물접수" in property_data:
@@ -1236,7 +1264,7 @@ class NotionUploader:
             # 층 구분 없는 flat 사진 목록
             children.extend(
                 self._build_photo_blocks(photo_urls)
-            )
+                    )
 
         # 특이사항 블록
         if "특이사항" in property_data:
@@ -1729,6 +1757,17 @@ class TelegramNotionBot:
     # 저장 대기 버퍼 (초) - 매물 설명 감지 후 이 시간 후에 저장 (실수 삭제 방지)
     PROPERTY_SAVE_BUFFER = 30
 
+    # ── 상가 특징 인라인 키보드 버튼 정의 ──
+    # (버튼 표시 텍스트, 노션 저장용 텍스트)
+    FEATURE_BUTTONS = [
+        ("채광", "채광좋음"),
+        ("빨간벽돌", "빨간벽돌"),
+        ("전면넓음", "전면넓음"),
+        ("단독건물", "단독건물"),
+        ("코너상가", "코너상가"),
+        ("통창·통유리", "통창/통유리"),
+    ]
+
     HELP_TEXT = (
         "🏠 *부동산 매물 등록 봇*\n\n"
         "사진과 함께 아래 형식으로 매물 정보를 보내주세요:\n\n"
@@ -1796,6 +1835,9 @@ class TelegramNotionBot:
         self._collect_tasks: Dict[int, asyncio.Task] = {}
         # 추가사진 버퍼: {orig_msg_id: {"photos": [], "label": str, "page_id": str, "timer_task": Task}}
         self._extra_photo_buffers: Dict[int, Dict] = {}
+        # 상가 특징 인라인 키보드 선택 상태
+        # {chat_id: {"selected": set(), "keyboard_msg_id": int, "finalized": bool}}
+        self._feature_selections: Dict[int, Dict] = {}
 
         # 매핑 파일 (봇 재시작 후에도 page_mapping 유지)
         self._mapping_file = "page_mapping.json"
@@ -1850,21 +1892,183 @@ class TelegramNotionBot:
         if not signature:
             logger.debug("author_signature가 없음")
             return None
-
+        
         sig = signature.strip()
         # 한국 이름 순서 정규화 ("진우 박" → "박진우")
         sig_norm = self._normalize_korean_name(sig)
         logger.info(f"서명 매칭 시도: '{sig}' → 정규화: '{sig_norm}'")
-
+        
         for name in self._staff_names:
             name_norm = re.sub(r"\s+", "", name)
             if name_norm == sig_norm or name_norm in sig_norm or sig_norm in name_norm:
                 logger.info(f"매칭 성공: '{sig}' → '{name}'")
                 return name
-
+        
         # 미리 등록된 이름과 매칭 안 되면 정규화된 서명을 그대로 사용
         logger.info(f"이름 목록 미매칭, 정규화 서명 저장: '{sig_norm}'")
         return sig_norm[:30] if sig_norm else None
+
+    # ──────────────────────────────────────────────
+    # 상가 특징 인라인 키보드 (9번 항목 자동 제안)
+    # ──────────────────────────────────────────────
+
+    def _build_feature_keyboard(
+        self, selected: set
+    ) -> InlineKeyboardMarkup:
+        """상가 특징 인라인 키보드 생성 (선택된 항목에 ✅ 토글)"""
+        buttons = []
+        row = []
+        for idx, (label, _) in enumerate(self.FEATURE_BUTTONS):
+            prefix = "✅ " if idx in selected else ""
+            row.append(
+                InlineKeyboardButton(
+                    f"{prefix}{label}",
+                    callback_data=f"feat_{idx}",
+                )
+            )
+            if len(row) == 3:
+                buttons.append(row)
+                row = []
+        if row:
+            buttons.append(row)
+        # 완료 버튼
+        buttons.append(
+            [InlineKeyboardButton(
+                "✅ 완료", callback_data="feat_done"
+            )]
+        )
+        return InlineKeyboardMarkup(buttons)
+
+    async def _send_feature_keyboard(
+        self, chat_id: int, context
+    ):
+        """상가 특징 인라인 키보드를 채팅에 전송"""
+        # 기존 키보드가 있으면 삭제
+        old = self._feature_selections.pop(chat_id, None)
+        if old and old.get("keyboard_msg_id"):
+            try:
+                await context.bot.delete_message(
+                    chat_id, old["keyboard_msg_id"]
+                )
+            except Exception:
+                pass
+
+        selected = set()
+        keyboard = self._build_feature_keyboard(selected)
+        try:
+            msg = await context.bot.send_message(
+                chat_id,
+                "🏬 상가 특징을 선택해주세요 (선택 후 ✅ 완료):",
+                reply_markup=keyboard,
+            )
+            self._feature_selections[chat_id] = {
+                "selected": selected,
+                "keyboard_msg_id": msg.message_id,
+                "finalized": False,
+            }
+            logger.info(
+                f"상가 특징 키보드 전송: chat_id={chat_id}, "
+                f"msg_id={msg.message_id}"
+            )
+        except Exception as e:
+            logger.error(f"상가 특징 키보드 전송 실패: {e}")
+
+    async def handle_feature_callback(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ):
+        """상가 특징 인라인 버튼 콜백 처리 (토글 / 완료)"""
+        query = update.callback_query
+        if not query:
+            return
+        await query.answer()
+
+        chat_id = query.message.chat_id
+        data = query.data
+
+        selection = self._feature_selections.get(chat_id)
+        if not selection or selection.get("finalized"):
+            # 이미 완료되었거나 세션 없음
+            try:
+                await query.edit_message_text("⏰ 시간 초과 또는 이미 완료됨")
+            except Exception:
+                pass
+            return
+
+        if data == "feat_done":
+            # 완료 버튼 → 키보드 삭제, 결과 텍스트 전송
+            await self._finalize_features(chat_id, context.bot)
+            return
+
+        # 토글: feat_0 ~ feat_5
+        try:
+            idx = int(data.replace("feat_", ""))
+        except ValueError:
+            return
+
+        if idx in selection["selected"]:
+            selection["selected"].discard(idx)
+        else:
+            selection["selected"].add(idx)
+
+        # 키보드 업데이트
+        keyboard = self._build_feature_keyboard(
+            selection["selected"]
+        )
+        try:
+            await query.edit_message_reply_markup(
+                reply_markup=keyboard
+            )
+        except Exception as e:
+            logger.warning(f"키보드 업데이트 실패: {e}")
+
+    def _get_feature_texts(self, selected: set) -> List[str]:
+        """선택된 인덱스를 노션 저장용 텍스트 리스트로 변환"""
+        return [
+            self.FEATURE_BUTTONS[idx][1]
+            for idx in sorted(selected)
+            if 0 <= idx < len(self.FEATURE_BUTTONS)
+        ]
+
+    async def _finalize_features(
+        self, chat_id: int, bot
+    ):
+        """상가 특징 선택 확정 → 키보드 삭제 + 결과 텍스트 전송"""
+        selection = self._feature_selections.get(chat_id)
+        if not selection or selection.get("finalized"):
+            return
+
+        selection["finalized"] = True
+
+        # 키보드 메시지 삭제
+        kb_msg_id = selection.get("keyboard_msg_id")
+        if kb_msg_id:
+            try:
+                await bot.delete_message(chat_id, kb_msg_id)
+            except Exception as e:
+                logger.warning(
+                    f"상가 특징 키보드 삭제 실패: {e}"
+                )
+
+        # 결과 텍스트 전송
+        features = self._get_feature_texts(
+            selection["selected"]
+        )
+        if features:
+            result_text = "9. " + ", ".join(features)
+        else:
+            result_text = "9. 해당없음"
+
+        try:
+            await bot.send_message(chat_id, result_text)
+        except Exception as e:
+            logger.warning(
+                f"상가 특징 결과 텍스트 전송 실패: {e}"
+            )
+
+        logger.info(
+            f"상가 특징 확정: chat_id={chat_id}, "
+            f"결과='{result_text}'"
+        )
 
     @staticmethod
     def _is_listing_format(
@@ -2010,7 +2214,7 @@ class TelegramNotionBot:
                 continue
             new_val = new_data[key]
             old_val = old_data.get(key)
-
+            
             # 리스트(multi_select) 타입 처리 (건축물용도 등)
             def _to_str(v):
                 if isinstance(v, list):
@@ -2163,6 +2367,15 @@ class TelegramNotionBot:
             f"{self.PROPERTY_SAVE_BUFFER}초 후 실행"
         )
 
+        # ── 9번 항목(상가 특징)이 없으면 인라인 키보드 제안 ──
+        has_section9 = bool(
+            re.search(r'(?:^|\n)\s*9\.', description)
+        )
+        if not has_section9:
+            await self._send_feature_keyboard(
+                chat_id, context
+            )
+
     async def _do_save_with_buffer(
         self,
         chat_id: int,
@@ -2183,7 +2396,28 @@ class TelegramNotionBot:
                 f"트리거 메시지 삭제됨, 저장 취소: chat_id={chat_id}"
             )
             self._clear_chat_buffer(chat_id)
+            # 상가 특징 키보드도 정리
+            sel = self._feature_selections.pop(chat_id, None)
+            if sel and sel.get("keyboard_msg_id"):
+                try:
+                    await bot.delete_message(
+                        chat_id, sel["keyboard_msg_id"]
+                    )
+                except Exception:
+                    pass
             return
+
+        # ── 상가 특징 인라인 키보드 확정 처리 ──
+        # (30초 이내에 완료 버튼을 안 눌렀으면 현재 상태로 자동 확정)
+        await self._finalize_features(chat_id, bot)
+
+        # 상가 특징 선택 결과 가져오기
+        selection = self._feature_selections.pop(chat_id, None)
+        extra_features = None
+        if selection and selection.get("selected"):
+            extra_features = self._get_feature_texts(
+                selection["selected"]
+            )
 
         # 버퍼에서 사진 & 층별 그룹 가져오기
         buf = self._chat_buffers.get(chat_id, {})
@@ -2213,6 +2447,7 @@ class TelegramNotionBot:
             description, trigger_message, photo_urls, author_sig,
             floor_photos=floor_photos_arg,
             first_photo_msg=first_photo_msg,
+            extra_features=extra_features,
         )
 
     # ──────────────────────────────────────────────
@@ -2406,8 +2641,8 @@ class TelegramNotionBot:
                     logger.info(
                         f"주소 검색 복수 결과, 최신 사용: "
                         f"'{first_line}' → {page_id} (총 {len(pages)}개)"
-                    )
-                    return page_id
+                )
+                return page_id
 
         return None
 
@@ -2922,6 +3157,7 @@ class TelegramNotionBot:
         author_sig: str = None,
         floor_photos: Optional[List[Dict]] = None,
         first_photo_msg=None,
+        extra_features: Optional[List[str]] = None,
     ):
         """매물 정보를 노션에 저장하고 원본 메시지에 노션 링크 추가
 
@@ -2930,6 +3166,7 @@ class TelegramNotionBot:
             trigger_message: 노션 링크를 추가할 기준 메시지
             photo_urls: 전체 사진 URL 목록 (없으면 빈 리스트)
             author_sig: 작성자 서명 (author_signature)
+            extra_features: 인라인 키보드에서 선택된 상가 특징 리스트
             floor_photos: 층별 사진 그룹 [{"label": "1층", "photos": [...]}]
                           None이면 구분 없이 flat 표시
         """
@@ -2938,6 +3175,11 @@ class TelegramNotionBot:
             property_data["원본 메시지"] = description
             property_data["telegram_chat_id"] = trigger_message.chat_id
             property_data["telegram_msg_id"] = trigger_message.message_id
+
+            # 인라인 키보드에서 선택된 상가 특징 주입
+            # (9번 항목이 텍스트에 없고 키보드에서 선택한 경우)
+            if extra_features and "상가_특징" not in property_data:
+                property_data["상가_특징"] = extra_features
 
             # 채널 서명에서 매물접수자 추출
             sig = author_sig or getattr(
@@ -4019,6 +4261,14 @@ class TelegramNotionBot:
                 filters.Regex(r"^/매물확인")
                 & filters.UpdateType.CHANNEL_POST,
                 self.property_check_command,
+            )
+        )
+
+        # 상가 특징 인라인 키보드 콜백
+        application.add_handler(
+            CallbackQueryHandler(
+                self.handle_feature_callback,
+                pattern=r"^feat_",
             )
         )
 
