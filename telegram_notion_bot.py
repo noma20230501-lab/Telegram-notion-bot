@@ -243,7 +243,7 @@ class PropertyParser:
                 #   1층 40.5/33.05     (소수점)
                 #   1층 40㎡/33㎡      (단위 포함)
                 면적_패턴 = re.findall(
-                    r'(\d+)층\s+'
+                    r'((?:지하\s*|-)\d+|\d+)\s*층\s+'
                     r'(?:계(?:약)?(?:면적)?\s*)?'   # 선택적 "계약" 접두사
                     r'(\d+\.?\d*)'                   # 계약면적 숫자
                     r'\s*(?:m2|㎡)?\s*'              # 선택적 단위
@@ -253,7 +253,8 @@ class PropertyParser:
                     content4
                 )
                 
-                for 층, 계약, 전용 in 면적_패턴:
+                for 층_raw, 계약, 전용 in 면적_패턴:
+                    층 = PropertyParser._normalize_floor_key(층_raw)
                     계약_f = float(계약)
                     전용_f = float(전용)
                     평 = round(전용_f / 3.3, 1)
@@ -266,14 +267,15 @@ class PropertyParser:
                 # 평수 명시 패턴 (예: "1층 계약48.43㎡ 전용48.43㎡ 14평")
                 # 위 패턴에서 못 잡은 경우만 추가 처리
                 상세_패턴 = re.findall(
-                    r'(\d+)층[^/]*?'
+                    r'((?:지하\s*|-)\d+|\d+)\s*층[^/]*?'
                     r'(?:계(?:약)?(?:면적)?\s*)?(\d+\.?\d*)\s*(?:m2|㎡)?[^/]*?'
                     r'전(?:용)?(?:면적)?\s*(\d+\.?\d*)\s*(?:m2|㎡)?[^/]*?'
                     r'(?:약\s*)?(\d+\.?\d*)\s*평',
                     content4
                 )
                 
-                for 층, 계약, 전용, 평 in 상세_패턴:
+                for 층_raw, 계약, 전용, 평 in 상세_패턴:
+                    층 = PropertyParser._normalize_floor_key(층_raw)
                     if 층 not in 층별_정보:  # 위 패턴과 중복 방지
                         층별_정보[층] = {
                             '계약': float(계약) if 계약 else 0,
@@ -304,8 +306,9 @@ class PropertyParser:
                         else:
                             평_str = str(평)
                         
-                        # 이모지 추가 (예: 1️⃣14p)
-                        이모지 = 층_이모지.get(층, f"{층}층")
+                        # 이모지 추가 (예: 1️⃣14p, 지하1층은 "지하1층14p")
+                        기본_표시 = PropertyParser._floor_display_name(층)
+                        이모지 = 층_이모지.get(층, 기본_표시)
                         층별_평수_parts.append(f"{이모지}{평_str}p")
                     
                     data["계약면적"] = 총_계약
@@ -369,11 +372,12 @@ class PropertyParser:
                             seen_set.add(use)
                     data["건축물용도"] = seen_uses  # 리스트 → multi_select
 
-                    # 층별용도 문자열 생성: "1층 제1종 / 2,3층 제2종"
+                    # 층별용도 문자열 생성: "1층 제1종 / 2,3층 제2종 / 지하1층 제1종"
                     abbr_parts = []
                     for fl, use in floor_use_pairs:
                         abbr = PropertyParser._abbreviate_building_use(use)
-                        abbr_parts.append(f"{fl}층 {abbr}")
+                        fl_display = PropertyParser._floor_display_name(fl)
+                        abbr_parts.append(f"{fl_display} {abbr}")
                     data["층별용도"] = " / ".join(abbr_parts)
 
                 elif len(floor_use_pairs) == 1:
@@ -497,9 +501,10 @@ class PropertyParser:
                 in_contacts = False
                 content9 = re.sub(r"^9\.\s*", "", line).strip()
                 if content9 and content9 != "해당없음":
+                    # 콤마로만 분리 (슬래시는 "통창/통유리" 등 항목 내부 구분자이므로 제외)
                     features = [
                         f.strip()
-                        for f in re.split(r'[,，/]', content9)
+                        for f in re.split(r'[,，]', content9)
                         if f.strip()
                     ]
                     if features:
@@ -669,6 +674,33 @@ class PropertyParser:
         return text
 
     @staticmethod
+    def _normalize_floor_key(floor_raw: str) -> str:
+        """층 문자열을 정규화된 키로 변환
+
+        "지하1"  → "-1"
+        "지하 1" → "-1"
+        "-1"     → "-1"
+        "1"      → "1"
+        """
+        s = re.sub(r'\s+', '', floor_raw)  # 공백 제거
+        if '지하' in s:
+            n = re.search(r'\d+', s)
+            return f"-{n.group()}" if n else s
+        return s
+
+    @staticmethod
+    def _floor_display_name(floor_key: str) -> str:
+        """정규화된 층 키를 노션 표시용 문자열로 변환
+
+        "-1" → "지하1층"
+        "-2" → "지하2층"
+        "1"  → "1층"
+        """
+        if floor_key.startswith('-'):
+            return f"지하{floor_key[1:]}층"
+        return f"{floor_key}층"
+
+    @staticmethod
     def _abbreviate_building_use(full_use: str) -> str:
         """노션 층별용도 표시용 약칭 변환 (짧게)"""
         return {
@@ -709,16 +741,18 @@ class PropertyParser:
         )
         cleaned = cleaned.strip()
 
-        # 층 마커 위치 탐색 (예: 1층, 2층, 2,3층, 1~3층)
+        # 층 마커 위치 탐색 (예: 1층, 2층, 2,3층, 1~3층, 지하1층, -1층)
         floor_markers = list(
-            re.finditer(r'(\d+(?:[,~\-]\d+)*)\s*층', cleaned)
+            re.finditer(r'((?:지하\s*|-)\d+|\d+(?:[,~\-]\d+)*)\s*층', cleaned)
         )
         if not floor_markers:
             return []
 
         results = []
         for i, marker in enumerate(floor_markers):
-            floor_key = marker.group(1)
+            floor_key_raw = marker.group(1)
+            # 지하층 정규화: "지하1" → "-1"
+            floor_key = PropertyParser._normalize_floor_key(floor_key_raw)
             # 용도 텍스트: 이 층 마커 끝 ~ 다음 층 마커 시작
             start = marker.end()
             end = (
@@ -833,29 +867,37 @@ class NotionUploader:
         # ── 층수 (multi_select) ──
         주소 = property_data.get("주소", "")
         층_list = []
-        
-        # 1. 범위 형식 우선: "1~3층", "1-3층"
-        범위_match = re.search(r'(\d+)[~\-](\d+)층', 주소)
-        if 범위_match:
-            start = int(범위_match.group(1))
-            end = int(범위_match.group(2))
-            층_list = [f"{i}층" for i in range(start, end + 1)]
+
+        # 0. 지하층 우선 감지: "지하N층", "지하 N층", "-N층"
+        지하_matches = re.findall(r'(?:지하\s*|(?<!\d)-\s*)(\d+)\s*층', 주소)
+        if 지하_matches:
+            층_list = [f"지하{n}층" for n in 지하_matches]
         else:
-            # 2. 콤마 구분 형식: "1,2,3층"
-            콤마_match = re.search(r'(\d+(?:,\d+)+)층', 주소)
-            if 콤마_match:
-                층_numbers = 콤마_match.group(1).split(',')
-                층_list = [f"{층.strip()}층" for 층 in 층_numbers]
+            # 지하층이 없을 때만 지상층 파싱 (오탐 방지를 위해 지하 표현 제거 후 처리)
+            주소_지상 = re.sub(r'(?:지하\s*|-\s*)\d+\s*층', '', 주소)
+
+            # 1. 범위 형식 우선: "1~3층", "1-3층"
+            범위_match = re.search(r'(\d+)[~\-](\d+)층', 주소_지상)
+            if 범위_match:
+                start = int(범위_match.group(1))
+                end = int(범위_match.group(2))
+                층_list = [f"{i}층" for i in range(start, end + 1)]
             else:
-                # 3. 연속 층 형식: "2층3층" 또는 "1층 2층 3층" (띄어쓰기 0~2개)
-                연속_matches = re.findall(r'(\d+)층', 주소)
-                if len(연속_matches) > 1:
-                    # 여러 층이 감지되면 모두 추가
-                    층_list = [f"{층}층" for 층 in 연속_matches]
-                elif len(연속_matches) == 1:
-                    # 4. 단일 층 형식: "1층"
-                    층_list = [f"{연속_matches[0]}층"]
-        
+                # 2. 콤마 구분 형식: "1,2,3층"
+                콤마_match = re.search(r'(\d+(?:,\d+)+)층', 주소_지상)
+                if 콤마_match:
+                    층_numbers = 콤마_match.group(1).split(',')
+                    층_list = [f"{층.strip()}층" for 층 in 층_numbers]
+                else:
+                    # 3. 연속 층 형식: "2층3층" 또는 "1층 2층 3층" (띄어쓰기 0~2개)
+                    연속_matches = re.findall(r'(\d+)층', 주소_지상)
+                    if len(연속_matches) > 1:
+                        # 여러 층이 감지되면 모두 추가
+                        층_list = [f"{층}층" for 층 in 연속_matches]
+                    elif len(연속_matches) == 1:
+                        # 4. 단일 층 형식: "1층"
+                        층_list = [f"{연속_matches[0]}층"]
+
         if 층_list:
             properties["층수"] = {
                 "multi_select": [{"name": 층} for 층 in 층_list]
@@ -1467,6 +1509,128 @@ class NotionUploader:
             logger.error(f"노션 블록 추가 실패: {e}")
             return False
 
+    def get_pages_missing_features(self) -> List[Dict]:
+        """상가 특징이 비어있는 추적 페이지 목록 조회
+
+        Returns:
+            [{"page_id": str, "title": str}, ...]
+        """
+        results = []
+        has_more = True
+        start_cursor = None
+
+        while has_more:
+            query_params = {
+                "database_id": self.database_id,
+                "page_size": 100,
+                "filter": {
+                    "and": [
+                        {
+                            "property": "telegram_msg_id",
+                            "number": {"is_not_empty": True},
+                        },
+                        {
+                            "property": "상가 특징",
+                            "multi_select": {"is_empty": True},
+                        },
+                    ]
+                },
+            }
+            if start_cursor:
+                query_params["start_cursor"] = start_cursor
+
+            try:
+                response = self.client.databases.query(
+                    **query_params
+                )
+            except Exception as e:
+                logger.error(
+                    f"상가 특징 누락 페이지 조회 실패: {e}"
+                )
+                break
+
+            for page in response.get("results", []):
+                if page.get("archived", False):
+                    continue
+                pid = page["id"]
+                props = page.get("properties", {})
+                title_arr = props.get(
+                    "주소 및 상호", {}
+                ).get("title", [])
+                title = (
+                    title_arr[0]
+                    .get("text", {})
+                    .get("content", "")
+                    if title_arr
+                    else ""
+                )
+                results.append({
+                    "page_id": pid,
+                    "title": title,
+                })
+
+            has_more = response.get("has_more", False)
+            start_cursor = response.get("next_cursor")
+
+        return results
+
+    def get_page_original_message(
+        self, page_id: str
+    ) -> Optional[str]:
+        """노션 페이지의 '원본 메시지' 블록 텍스트를 읽어서 반환"""
+        try:
+            has_more = True
+            start_cursor = None
+            found_heading = False
+
+            while has_more:
+                params = {
+                    "block_id": page_id,
+                    "page_size": 100,
+                }
+                if start_cursor:
+                    params["start_cursor"] = start_cursor
+
+                response = self.client.blocks.children.list(
+                    **params
+                )
+
+                for block in response.get("results", []):
+                    btype = block.get("type", "")
+
+                    if btype == "heading_3":
+                        rt = block["heading_3"].get(
+                            "rich_text", []
+                        )
+                        if rt:
+                            text = rt[0].get(
+                                "text", {}
+                            ).get("content", "")
+                            if "원본 메시지" in text:
+                                found_heading = True
+                                continue
+
+                    if found_heading and btype == "paragraph":
+                        rt = block["paragraph"].get(
+                            "rich_text", []
+                        )
+                        if rt:
+                            return rt[0].get(
+                                "text", {}
+                            ).get("content", "")
+                        return None
+
+                has_more = response.get("has_more", False)
+                start_cursor = response.get("next_cursor")
+
+            return None
+        except Exception as e:
+            logger.warning(
+                f"원본 메시지 블록 읽기 실패 "
+                f"(page_id={page_id}): {e}"
+            )
+            return None
+
     def find_page_by_msg_id(self, msg_id: int) -> Optional[str]:
         """telegram_msg_id로 노션 페이지 ID 조회 (봇 재시작 후 복구용)"""
         try:
@@ -1496,9 +1660,9 @@ class NotionUploader:
         """
         # 괄호 제거
         addr = re.split(r'[\(（]', address)[0].strip()
-        # "[숫자]층" 뒤에 "일부" 가 오면 "일부"까지, 아니면 층까지만
+        # "지하N층" 또는 "[숫자]층" 뒤에 "일부" 가 오면 "일부"까지, 아니면 층까지만
         m = re.search(
-            r'(\d+\s*층(?:\s*일부)?)',
+            r'((?:지하\s*|-\s*)?\d+\s*층(?:\s*일부)?)',
             addr,
         )
         if m:
@@ -1692,6 +1856,16 @@ class NotionUploader:
                             .get("content", "")
                         )
 
+            # 상가 특징 (multi_select) - 리스트로 반환
+            if "상가 특징" in props:
+                ms = props["상가 특징"].get("multi_select", [])
+                if ms:
+                    result["상가_특징"] = [
+                        item.get("name", "")
+                        for item in ms
+                        if item.get("name")
+                    ]
+
             # 전화번호 속성
             if "📞 대표 연락처" in props:
                 val = props["📞 대표 연락처"].get(
@@ -1798,6 +1972,10 @@ class TelegramNotionBot:
         ("단독", "단독"),
         ("코너", "코너"),
         ("통창·통유리", "통창/통유리"),
+        ("주택개조", "주택개조"),
+        ("주차2대⬆", "주차2대⬆"),
+        ("신축", "신축"),
+        ("사무실", "사무실"),
     ]
 
     HELP_TEXT = (
@@ -2822,14 +3000,22 @@ class TelegramNotionBot:
             # 수정된 매물 정보 파싱 (주소 포함)
             new_property_data = {}
             if property_text != old_property_text:
+                # 9번 항목 재정렬 후 파싱 (특이사항이 중간에 껴서 9번이 누락되는 것 방지)
+                reordered_text = self._reorder_section9(property_text)
                 # 매물 정보가 변경된 경우에만 파싱
                 new_property_data = self.parser.parse_property_info(
-                    property_text, skip_address=False
+                    reordered_text, skip_address=False
                 )
                 if not new_property_data:
                     new_property_data = {}
                 # 특이사항 추가 모드는 원본 수정에서는 지원 안 함
                 new_property_data.pop("특이사항_추가", None)
+                
+                # 상가 특징 보존: 파싱 결과에 없으면 기존 노션 값 유지
+                if "상가_특징" not in new_property_data:
+                    existing_features = old_data.get("상가_특징")
+                    if existing_features:
+                        new_property_data["상가_특징"] = existing_features
             
             # 거래 완료 처리 (구분선 위/아래 모두 체크)
             if has_deal_completed:
@@ -3804,10 +3990,108 @@ class TelegramNotionBot:
         asyncio.create_task(
             self._auto_sync_loop(application)
         )
+        asyncio.create_task(
+            self._recover_features_on_startup()
+        )
         logger.info(
             f"자동 동기화 태스크 시작 "
             f"(주기: {self.AUTO_SYNC_INTERVAL // 3600}시간)"
         )
+
+    async def _recover_features_on_startup(self):
+        """봇 시작 시 상가 특징이 비어있는 매물을 원본 메시지에서 복구"""
+        # 초기화 안정화 대기
+        await asyncio.sleep(30)
+        logger.info(
+            "🔄 상가 특징 자동 복구 시작..."
+        )
+
+        try:
+            # 1. 상가 특징이 비어있는 페이지 목록 조회
+            pages = (
+                self.notion_uploader.get_pages_missing_features()
+            )
+            if not pages:
+                logger.info(
+                    "✅ 상가 특징 복구 대상 없음 (모두 정상)"
+                )
+                return
+
+            logger.info(
+                f"📋 상가 특징 누락 페이지 {len(pages)}개 발견"
+            )
+
+            recovered = 0
+            skipped = 0
+
+            for page_info in pages:
+                page_id = page_info["page_id"]
+                title = page_info.get("title", "?")
+
+                try:
+                    # 2. 원본 메시지 블록에서 텍스트 읽기
+                    original_text = (
+                        self.notion_uploader
+                        .get_page_original_message(page_id)
+                    )
+                    if not original_text:
+                        skipped += 1
+                        continue
+
+                    # 3. 9번 항목 재정렬 후 파싱
+                    reordered = self._reorder_section9(
+                        original_text
+                    )
+                    parsed = (
+                        self.parser.parse_property_info(
+                            reordered
+                        )
+                    )
+                    features = parsed.get("상가_특징")
+
+                    if not features:
+                        skipped += 1
+                        continue
+
+                    # 4. 노션 상가 특징 업데이트
+                    update_props = {
+                        "상가 특징": {
+                            "multi_select": [
+                                {"name": f}
+                                for f in features
+                            ]
+                        }
+                    }
+                    self.notion_uploader.client.pages.update(
+                        page_id=page_id,
+                        properties=update_props,
+                    )
+                    recovered += 1
+                    logger.info(
+                        f"  ✅ 복구: {title} → "
+                        f"{', '.join(features)}"
+                    )
+
+                    # Notion API 속도 제한 방지
+                    await asyncio.sleep(0.4)
+
+                except Exception as e:
+                    logger.warning(
+                        f"  ⚠️ 복구 실패 ({title}): {e}"
+                    )
+                    continue
+
+            logger.info(
+                f"🔄 상가 특징 복구 완료: "
+                f"복구 {recovered}개 / 스킵 {skipped}개 / "
+                f"전체 {len(pages)}개"
+            )
+
+        except Exception as e:
+            logger.error(
+                f"상가 특징 자동 복구 오류: {e}",
+                exc_info=True,
+            )
 
     async def _auto_sync_loop(self, application):
         """백그라운드에서 주기적으로 동기화 실행"""
