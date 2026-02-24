@@ -59,6 +59,12 @@ class PropertyParser:
         start_idx = 0
         if not skip_address and lines:
             주소_line = lines[0].strip()
+            # -N층 → 지하N층 정규화 (숫자 앞 - 기호, 앞에 다른 숫자 없는 경우)
+            주소_line = re.sub(
+                r'(?<!\d)-\s*(\d+)\s*층',
+                lambda m: f"지하{m.group(1)}층",
+                주소_line,
+            )
             data["주소"] = 주소_line
             
             # 매물 유형 감지: 괄호 안에 "복층" 또는 "통상가" 포함
@@ -1196,6 +1202,18 @@ class NotionUploader:
                 "number": property_data["telegram_msg_id"]
             }
 
+        # ── 매물번호 (rich_text) ──
+        if "매물번호" in property_data:
+            properties["매물번호"] = {
+                "rich_text": [
+                    {
+                        "text": {
+                            "content": property_data["매물번호"]
+                        }
+                    }
+                ]
+            }
+
         return properties
 
     @staticmethod
@@ -1291,6 +1309,68 @@ class NotionUploader:
         # ──────────────────────────────────────────────
         children = []
 
+        # ── 매물번호 블록 (최상단) ──
+        if "매물번호" in property_data:
+            children.append(
+                {
+                    "object": "block",
+                    "type": "callout",
+                    "callout": {
+                        "rich_text": [
+                            {
+                                "text": {
+                                    "content": f"매물번호  {property_data['매물번호']}"
+                                }
+                            }
+                        ],
+                        "icon": {
+                            "emoji": "🏷️"
+                        },
+                        "color": "gray_background",
+                    },
+                }
+            )
+
+        # ── 특이사항 블록 (사진 위에 먼저 표시) ──
+        if "특이사항" in property_data:
+            children.append(
+                {
+                    "object": "block",
+                    "type": "heading_2",
+                    "heading_2": {
+                        "rich_text": [
+                            {"text": {"content": "특이사항"}}
+                        ]
+                    },
+                }
+            )
+            for paragraph in property_data["특이사항"].split("\n"):
+                if paragraph.strip():
+                    children.append(
+                        {
+                            "object": "block",
+                            "type": "paragraph",
+                            "paragraph": {
+                                "rich_text": [
+                                    {
+                                        "text": {
+                                            "content": paragraph
+                                        }
+                                    }
+                                ]
+                            },
+                        }
+                    )
+            # 특이사항과 사진 사이 구분선
+            children.append(
+                {
+                    "object": "block",
+                    "type": "divider",
+                    "divider": {},
+                }
+            )
+
+        # ── 사진 블록 ──
         if floor_photos and any(
             g.get("photos") for g in floor_photos
         ):
@@ -1328,38 +1408,7 @@ class NotionUploader:
             # 층 구분 없는 flat 사진 목록
             children.extend(
                 self._build_photo_blocks(photo_urls)
-                    )
-
-        # 특이사항 블록
-        if "특이사항" in property_data:
-            children.append(
-                {
-                    "object": "block",
-                    "type": "heading_2",
-                    "heading_2": {
-                        "rich_text": [
-                            {"text": {"content": "특이사항"}}
-                        ]
-                    },
-                }
             )
-            for paragraph in property_data["특이사항"].split("\n"):
-                if paragraph.strip():
-                    children.append(
-                        {
-                            "object": "block",
-                            "type": "paragraph",
-                            "paragraph": {
-                                "rich_text": [
-                                    {
-                                        "text": {
-                                            "content": paragraph
-                                        }
-                                    }
-                                ]
-                            },
-                        }
-                    )
 
         # 원본 메시지
         if "원본 메시지" in property_data:
@@ -1530,6 +1579,130 @@ class NotionUploader:
         except Exception as e:
             logger.error(f"노션 블록 추가 실패: {e}")
             return False
+
+    def get_next_property_number(self) -> str:
+        """노션 DB에서 현재 최대 매물번호를 조회해 다음 번호 반환.
+
+        Returns:
+            "N01", "N02" ... "N99", "N100" 형식 문자열
+        """
+        max_num = 0
+        has_more = True
+        start_cursor = None
+
+        while has_more:
+            params = {
+                "database_id": self.database_id,
+                "page_size": 100,
+                "filter": {
+                    "property": "매물번호",
+                    "rich_text": {"is_not_empty": True},
+                },
+            }
+            if start_cursor:
+                params["start_cursor"] = start_cursor
+
+            try:
+                response = self.client.databases.query(**params)
+            except Exception as e:
+                logger.warning(f"매물번호 조회 실패: {e}")
+                break
+
+            for page in response.get("results", []):
+                rt = (
+                    page.get("properties", {})
+                    .get("매물번호", {})
+                    .get("rich_text", [])
+                )
+                if rt:
+                    raw = rt[0].get("text", {}).get("content", "")
+                    # "N01" → 1, "N100" → 100
+                    m = re.match(r"N(\d+)$", raw.strip())
+                    if m:
+                        max_num = max(max_num, int(m.group(1)))
+
+            has_more = response.get("has_more", False)
+            start_cursor = response.get("next_cursor")
+
+        next_num = max_num + 1
+        # 1~99는 2자리 패딩, 100 이상은 그대로
+        if next_num < 100:
+            return f"N{next_num:02d}"
+        return f"N{next_num}"
+
+    def get_pages_missing_number(self) -> List[Dict]:
+        """매물번호가 없는 페이지 목록을 생성일 오름차순으로 반환.
+
+        Returns:
+            [{"page_id": str, "title": str,
+              "created_time": str, "msg_id": int|None}, ...]
+        """
+        results = []
+        has_more = True
+        start_cursor = None
+
+        while has_more:
+            params = {
+                "database_id": self.database_id,
+                "page_size": 100,
+                "filter": {
+                    "and": [
+                        {
+                            "property": "telegram_msg_id",
+                            "number": {"is_not_empty": True},
+                        },
+                        {
+                            "property": "매물번호",
+                            "rich_text": {"is_empty": True},
+                        },
+                    ]
+                },
+            }
+            if start_cursor:
+                params["start_cursor"] = start_cursor
+
+            try:
+                response = self.client.databases.query(**params)
+            except Exception as e:
+                logger.error(f"매물번호 누락 페이지 조회 실패: {e}")
+                break
+
+            for page in response.get("results", []):
+                if page.get("archived", False):
+                    continue
+                pid = page["id"]
+                props = page.get("properties", {})
+                title_arr = props.get(
+                    "주소 및 상호", {}
+                ).get("title", [])
+                title = (
+                    title_arr[0]
+                    .get("text", {})
+                    .get("content", "")
+                    if title_arr
+                    else ""
+                )
+                msg_id_raw = (
+                    props.get("telegram_msg_id", {})
+                    .get("number")
+                )
+                results.append({
+                    "page_id": pid,
+                    "title": title,
+                    "created_time": page.get(
+                        "created_time", ""
+                    ),
+                    "msg_id": int(msg_id_raw)
+                    if msg_id_raw
+                    else None,
+                })
+
+            has_more = response.get("has_more", False)
+            start_cursor = response.get("next_cursor")
+
+        # 생성일 오름차순 정렬
+        results.sort(key=lambda x: x["created_time"])
+        return results
 
     def get_pages_missing_features(self) -> List[Dict]:
         """상가 특징이 비어있는 추적 페이지 목록 조회
@@ -2070,6 +2243,10 @@ class TelegramNotionBot:
         # 상가 특징 인라인 키보드 선택 상태
         # {chat_id: {"selected": set(), "keyboard_msg_id": int, "finalized": bool}}
         self._feature_selections: Dict[int, Dict] = {}
+        # 지하층 실제 위치 확인 상태
+        # {chat_id: {"chosen": None|"underground"|"ground1",
+        #             "confirm_msg_id": int, "original_floor": str}}
+        self._basement_selections: Dict[int, Dict] = {}
 
         # 매핑 파일 (봇 재시작 후에도 page_mapping 유지)
         self._mapping_file = "page_mapping.json"
@@ -2315,6 +2492,90 @@ class TelegramNotionBot:
             if 0 <= idx < len(self.FEATURE_BUTTONS)
         ]
 
+    # ──────────────────────────────────────────────
+    # 지하층 실제 위치 확인 버튼
+    # ──────────────────────────────────────────────
+
+    @staticmethod
+    def _detect_basement_floor(description: str) -> Optional[str]:
+        """주소 첫 줄에서 지하층 표기 감지 → '지하N층' 반환, 없으면 None"""
+        first_line = description.strip().split("\n")[0]
+        m = re.search(r'(지하\s*\d+\s*층)', first_line)
+        return m.group(1).replace(" ", "") if m else None
+
+    async def _send_basement_confirm(
+        self, chat_id: int, floor_text: str, context
+    ):
+        """지하층 확인 메시지 + 버튼 전송"""
+        # 기존 확인 메시지가 있으면 삭제
+        old = self._basement_selections.pop(chat_id, None)
+        if old and old.get("confirm_msg_id"):
+            try:
+                await context.bot.delete_message(
+                    chat_id, old["confirm_msg_id"]
+                )
+            except Exception:
+                pass
+
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "🔽 순수 지하층",
+                    callback_data="bsmt_u",
+                ),
+                InlineKeyboardButton(
+                    "🏪 지상 1층에 위치",
+                    callback_data="bsmt_g",
+                ),
+            ]
+        ])
+        try:
+            msg = await context.bot.send_message(
+                chat_id,
+                f"🔔 지하층 매물입니다. 실제 위치를 선택해주세요.\n"
+                f"(미선택 시 {floor_text}으로 저장됩니다)",
+                reply_markup=keyboard,
+            )
+            self._basement_selections[chat_id] = {
+                "chosen": None,
+                "confirm_msg_id": msg.message_id,
+                "original_floor": floor_text,
+            }
+        except Exception as e:
+            logger.error(f"지하층 확인 메시지 전송 실패: {e}")
+
+    async def handle_basement_callback(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ):
+        """지하층 위치 확인 버튼 콜백"""
+        query = update.callback_query
+        if not query:
+            return
+        chat_id = query.message.chat_id
+        data = query.data
+
+        sel = self._basement_selections.get(chat_id)
+        if not sel:
+            await query.answer()
+            try:
+                await query.edit_message_text("⏰ 이미 처리되었습니다.")
+            except Exception:
+                pass
+            return
+
+        if data == "bsmt_u":
+            sel["chosen"] = "underground"
+            label = "🔽 순수 지하층으로 저장됩니다."
+        else:  # bsmt_g
+            sel["chosen"] = "ground1"
+            label = "🏪 지상 1층으로 저장됩니다."
+
+        await query.answer()
+        try:
+            await query.edit_message_text(f"✅ {label}")
+        except Exception:
+            pass
+
     async def _finalize_features(
         self, chat_id: int, bot
     ):
@@ -2434,7 +2695,7 @@ class TelegramNotionBot:
     @staticmethod
     def _build_notion_section(
         page_url: str, page_id: str, update_log: str = "",
-        use_html: bool = True,
+        use_html: bool = True, property_number: str = "",
     ) -> str:
         """구분선 아래 노션 정보 섹션 생성
 
@@ -2443,16 +2704,18 @@ class TelegramNotionBot:
             page_id: 노션 페이지 ID
             update_log: 수정 이력 문자열
             use_html: True면 HTML 하이퍼링크, False면 plain text
+            property_number: 매물번호 (예: "N01")
         """
+        num_prefix = f"{property_number}  " if property_number else ""
         if use_html:
             section = (
                 f"\n\n{TelegramNotionBot.DIVIDER}\n"
-                f'✅ <a href="{page_url}">Notion</a>'
+                f'✅ {num_prefix}<a href="{page_url}">Notion</a>'
             )
         else:
             section = (
                 f"\n\n{TelegramNotionBot.DIVIDER}\n"
-                f"✅ Notion\n"
+                f"✅ {num_prefix}Notion\n"
                 f"🔗 {page_url}"
             )
         if update_log:
@@ -2657,6 +2920,13 @@ class TelegramNotionBot:
                 chat_id, context
             )
 
+        # ── 지하층 매물이면 실제 위치 확인 버튼 전송 ──
+        basement_floor = self._detect_basement_floor(description)
+        if basement_floor:
+            await self._send_basement_confirm(
+                chat_id, basement_floor, context
+            )
+
     async def _do_save_with_buffer(
         self,
         chat_id: int,
@@ -2691,6 +2961,25 @@ class TelegramNotionBot:
         # ── 상가 특징 인라인 키보드 확정 처리 ──
         # (30초 이내에 완료 버튼을 안 눌렀으면 현재 상태로 자동 확정)
         await self._finalize_features(chat_id, bot)
+
+        # ── 지하층 위치 선택 처리 ──
+        basement_sel = self._basement_selections.pop(chat_id, None)
+        if basement_sel:
+            # 확인 메시지 삭제 (아직 남아있으면)
+            cm_id = basement_sel.get("confirm_msg_id")
+            if cm_id:
+                try:
+                    await bot.delete_message(chat_id, cm_id)
+                except Exception:
+                    pass
+            # "지상 1층에 위치" 선택 시 → 주소의 지하N층을 1층으로 교체
+            if basement_sel.get("chosen") == "ground1":
+                description = re.sub(
+                    r'지하\s*\d+\s*층',
+                    '1층',
+                    description,
+                    count=1,
+                )
 
         # 상가 특징 선택 결과 가져오기
         selection = self._feature_selections.pop(chat_id, None)
@@ -3486,6 +3775,12 @@ class TelegramNotionBot:
             if staff:
                 property_data["매물접수"] = staff
 
+            # 매물번호 채번
+            property_number = (
+                self.notion_uploader.get_next_property_number()
+            )
+            property_data["매물번호"] = property_number
+
             # 노션 업로드
             page_url, page_id = self.notion_uploader.upload_property(
                 property_data,
@@ -3511,10 +3806,12 @@ class TelegramNotionBot:
 
             # 원본 메시지에 노션 링크 추가
             notion_html = self._build_notion_section(
-                page_url, page_id, use_html=True
+                page_url, page_id, use_html=True,
+                property_number=property_number,
             )
             notion_plain = self._build_notion_section(
-                page_url, page_id, use_html=False
+                page_url, page_id, use_html=False,
+                property_number=property_number,
             )
             is_caption = trigger_message.caption is not None
             success = await self._safe_edit_message(
@@ -4010,16 +4307,186 @@ class TelegramNotionBot:
 
     async def _post_init(self, application):
         """봇 초기화 후 자동 동기화 백그라운드 태스크 시작"""
+        self._app = application
         asyncio.create_task(
             self._auto_sync_loop(application)
         )
         asyncio.create_task(
             self._recover_features_on_startup()
         )
+        asyncio.create_task(
+            self._recover_property_numbers_on_startup()
+        )
         logger.info(
             f"자동 동기화 태스크 시작 "
             f"(주기: {self.AUTO_SYNC_INTERVAL // 3600}시간)"
         )
+
+    async def _recover_property_numbers_on_startup(self):
+        """봇 시작 시 매물번호 없는 매물에 순서대로 번호 부여 + 텔레그램 메시지 갱신"""
+        await asyncio.sleep(15)
+        logger.info("🔢 매물번호 소급적용 시작...")
+
+        try:
+            pages = (
+                self.notion_uploader.get_pages_missing_number()
+            )
+            if not pages:
+                logger.info("✅ 매물번호 소급 대상 없음")
+                return
+
+            logger.info(
+                f"📋 매물번호 누락 {len(pages)}개 발견"
+            )
+
+            # 현재 최대 번호 이후부터 채번
+            # (get_next_property_number 는 매번 DB 조회하므로
+            #  루프 안에서 호출하면 느림 → 시작값 한 번만 가져오고 직접 증가)
+            start_raw = (
+                self.notion_uploader.get_next_property_number()
+            )
+            # "N01" → 1, "N100" → 100
+            m = re.match(r"N(\d+)$", start_raw)
+            counter = int(m.group(1)) if m else 1
+
+            assigned = 0
+
+            for page_info in pages:
+                page_id = page_info["page_id"]
+                title = page_info.get("title", "?")
+                msg_id = page_info.get("msg_id")
+
+                num_str = (
+                    f"N{counter:02d}"
+                    if counter < 100
+                    else f"N{counter}"
+                )
+
+                try:
+                    # 1) 노션 속성 업데이트
+                    self.notion_uploader.client.pages.update(
+                        page_id=page_id,
+                        properties={
+                            "매물번호": {
+                                "rich_text": [
+                                    {
+                                        "text": {
+                                            "content": num_str
+                                        }
+                                    }
+                                ]
+                            }
+                        },
+                    )
+
+                    # 2) 노션 페이지 본문 최상단에 매물번호 블록 추가
+                    try:
+                        self.notion_uploader.client.blocks.children.append(
+                            block_id=page_id,
+                            children=[
+                                {
+                                    "object": "block",
+                                    "type": "callout",
+                                    "callout": {
+                                        "rich_text": [
+                                            {
+                                                "text": {
+                                                    "content": f"매물번호  {num_str}"
+                                                }
+                                            }
+                                        ],
+                                        "icon": {"emoji": "🏷️"},
+                                        "color": "gray_background",
+                                    },
+                                }
+                            ],
+                        )
+                    except Exception as be:
+                        logger.warning(
+                            f"  매물번호 블록 추가 실패 ({title}): {be}"
+                        )
+
+                    # 3) 텔레그램 메시지 수정 (DIVIDER 아래 줄 교체)
+                    if msg_id and msg_id in self._page_mapping:
+                        chat_id = self._msg_chat_ids.get(msg_id)
+                        if chat_id:
+                            try:
+                                # 현재 메시지 가져오기는 불가 → 저장된 original 텍스트 활용
+                                orig = self._original_texts.get(
+                                    msg_id, ""
+                                )
+                                if orig:
+                                    page_url = (
+                                        f"https://www.notion.so/"
+                                        f"{page_id.replace('-', '')}"
+                                    )
+                                    notion_html = (
+                                        self._build_notion_section(
+                                            page_url, page_id,
+                                            use_html=True,
+                                            property_number=num_str,
+                                        )
+                                    )
+                                    notion_plain = (
+                                        self._build_notion_section(
+                                            page_url, page_id,
+                                            use_html=False,
+                                            property_number=num_str,
+                                        )
+                                    )
+                                    html_full = (
+                                        html.escape(orig) + notion_html
+                                    )
+                                    try:
+                                        await self._app.bot.edit_message_caption(
+                                            chat_id=chat_id,
+                                            message_id=msg_id,
+                                            caption=html_full,
+                                            parse_mode="HTML",
+                                        )
+                                    except Exception:
+                                        try:
+                                            await self._app.bot.edit_message_text(
+                                                chat_id=chat_id,
+                                                message_id=msg_id,
+                                                text=html_full,
+                                                parse_mode="HTML",
+                                            )
+                                        except Exception:
+                                            plain_full = orig + notion_plain
+                                            try:
+                                                await self._app.bot.edit_message_caption(
+                                                    chat_id=chat_id,
+                                                    message_id=msg_id,
+                                                    caption=plain_full,
+                                                )
+                                            except Exception:
+                                                pass
+                            except Exception as te:
+                                logger.warning(
+                                    f"  텔레그램 메시지 수정 실패 "
+                                    f"({title}): {te}"
+                                )
+
+                    assigned += 1
+                    counter += 1
+                    logger.info(f"  ✅ {num_str} → {title}")
+                    await asyncio.sleep(0.4)
+
+                except Exception as e:
+                    logger.warning(
+                        f"  ⚠️ 번호 부여 실패 ({title}): {e}"
+                    )
+                    continue
+
+            logger.info(
+                f"🔢 매물번호 소급 완료: {assigned}/{len(pages)}개"
+            )
+
+        except Exception as e:
+            logger.error(
+                f"매물번호 소급 오류: {e}", exc_info=True
+            )
 
     async def _recover_features_on_startup(self):
         """봇 시작 시 상가 특징이 비어있는 매물을 원본 메시지에서 복구"""
@@ -4664,6 +5131,14 @@ class TelegramNotionBot:
             CallbackQueryHandler(
                 self.handle_feature_callback,
                 pattern=r"^feat_",
+            )
+        )
+
+        # 지하층 실제 위치 확인 콜백
+        application.add_handler(
+            CallbackQueryHandler(
+                self.handle_basement_callback,
+                pattern=r"^bsmt_",
             )
         )
 
