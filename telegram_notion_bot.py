@@ -434,16 +434,15 @@ class PropertyParser:
                         pmemo = re.sub(
                             r'^주차\s*[는은]?\s*', '', parking_text
                         ).strip()
-                        # "o", "O", "ㅇ", "가능" 제거
-                        pmemo = re.sub(r'^[oOㅇ가능]\s*', '', pmemo).strip()
-                        pmemo = re.sub(r'^가능\s*', '', pmemo).strip()
+                        # "o", "O", "ㅇ", "가능" 제거 (가능은 단어 단위로 제거)
+                        pmemo = re.sub(r'^(?:가능|[oOㅇ])\s*', '', pmemo).strip()
                         pmemo = re.sub(r'^장\s*사용', '주차장', pmemo)
                         
                         # 괄호 내용은 유지하되 괄호만 제거
                         pmemo = pmemo.replace('(', '').replace(')', '')
                         
                         pmemo = re.sub(
-                            r'하긴한데|애매|선착순', '', pmemo
+                            r'하긴한데|애매', '', pmemo
                         ).strip()
                         
                         # 한글과 숫자 사이 공백 추가 (기계식60대 → 기계식 60대)
@@ -1309,64 +1308,25 @@ class NotionUploader:
         # ──────────────────────────────────────────────
         children = []
 
-        # ── 매물번호 블록 (최상단) ──
+        # ── 매물번호 블록 (최상단, paragraph 형식 - 노션 검색 가능) ──
         if "매물번호" in property_data:
             children.append(
                 {
                     "object": "block",
-                    "type": "callout",
-                    "callout": {
+                    "type": "paragraph",
+                    "paragraph": {
                         "rich_text": [
                             {
                                 "text": {
-                                    "content": f"매물번호  {property_data['매물번호']}"
+                                    "content": f"🏷️ 매물번호  {property_data['매물번호']}"
+                                },
+                                "annotations": {
+                                    "bold": True,
+                                    "color": "gray"
                                 }
                             }
-                        ],
-                        "icon": {
-                            "emoji": "🏷️"
-                        },
-                        "color": "gray_background",
-                    },
-                }
-            )
-
-        # ── 특이사항 블록 (사진 위에 먼저 표시) ──
-        if "특이사항" in property_data:
-            children.append(
-                {
-                    "object": "block",
-                    "type": "heading_2",
-                    "heading_2": {
-                        "rich_text": [
-                            {"text": {"content": "특이사항"}}
                         ]
                     },
-                }
-            )
-            for paragraph in property_data["특이사항"].split("\n"):
-                if paragraph.strip():
-                    children.append(
-                        {
-                            "object": "block",
-                            "type": "paragraph",
-                            "paragraph": {
-                                "rich_text": [
-                                    {
-                                        "text": {
-                                            "content": paragraph
-                                        }
-                                    }
-                                ]
-                            },
-                        }
-                    )
-            # 특이사항과 사진 사이 구분선
-            children.append(
-                {
-                    "object": "block",
-                    "type": "divider",
-                    "divider": {},
                 }
             )
 
@@ -1409,6 +1369,44 @@ class NotionUploader:
             children.extend(
                 self._build_photo_blocks(photo_urls)
             )
+
+        # ── 특이사항 블록 (사진 아래에 표시) ──
+        if "특이사항" in property_data and property_data["특이사항"].strip():
+            children.append(
+                {
+                    "object": "block",
+                    "type": "divider",
+                    "divider": {},
+                }
+            )
+            children.append(
+                {
+                    "object": "block",
+                    "type": "heading_2",
+                    "heading_2": {
+                        "rich_text": [
+                            {"text": {"content": "특이사항"}}
+                        ]
+                    },
+                }
+            )
+            for paragraph in property_data["특이사항"].split("\n"):
+                if paragraph.strip():
+                    children.append(
+                        {
+                            "object": "block",
+                            "type": "paragraph",
+                            "paragraph": {
+                                "rich_text": [
+                                    {
+                                        "text": {
+                                            "content": paragraph
+                                        }
+                                    }
+                                ]
+                            },
+                        }
+                    )
 
         # 원본 메시지
         if "원본 메시지" in property_data:
@@ -4379,24 +4377,26 @@ class TelegramNotionBot:
                         },
                     )
 
-                    # 2) 노션 페이지 본문 최상단에 매물번호 블록 추가
+                    # 2) 노션 페이지 본문 최상단에 매물번호 블록 추가 (paragraph 형식 - 노션 검색 가능)
                     try:
                         self.notion_uploader.client.blocks.children.append(
                             block_id=page_id,
                             children=[
                                 {
                                     "object": "block",
-                                    "type": "callout",
-                                    "callout": {
+                                    "type": "paragraph",
+                                    "paragraph": {
                                         "rich_text": [
                                             {
                                                 "text": {
-                                                    "content": f"매물번호  {num_str}"
+                                                    "content": f"🏷️ 매물번호  {num_str}"
+                                                },
+                                                "annotations": {
+                                                    "bold": True,
+                                                    "color": "gray"
                                                 }
                                             }
-                                        ],
-                                        "icon": {"emoji": "🏷️"},
-                                        "color": "gray_background",
+                                        ]
                                     },
                                 }
                             ],
