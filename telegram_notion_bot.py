@@ -1094,9 +1094,10 @@ class NotionUploader:
 
         # ── 📅등록 날짜 (date) - 신규 등록 시에만 ──
         if not is_update:
+            now_dt = datetime.now()
             properties["📅등록 날짜"] = {
                 "date": {
-                    "start": datetime.now().date().isoformat()
+                    "start": now_dt.strftime("%Y-%m-%dT%H:%M:%S+09:00")
                 }
             }
 
@@ -1201,18 +1202,6 @@ class NotionUploader:
                 "number": property_data["telegram_msg_id"]
             }
 
-        # ── 매물번호 (rich_text) ──
-        if "매물번호" in property_data:
-            properties["매물번호"] = {
-                "rich_text": [
-                    {
-                        "text": {
-                            "content": property_data["매물번호"]
-                        }
-                    }
-                ]
-            }
-
         return properties
 
     @staticmethod
@@ -1307,28 +1296,6 @@ class NotionUploader:
         # 페이지 내용 (본문 블록) - 층별 사진 헤딩 지원
         # ──────────────────────────────────────────────
         children = []
-
-        # ── 매물번호 블록 (최상단, paragraph 형식 - 노션 검색 가능) ──
-        if "매물번호" in property_data:
-            children.append(
-                {
-                    "object": "block",
-                    "type": "paragraph",
-                    "paragraph": {
-                        "rich_text": [
-                            {
-                                "text": {
-                                    "content": f"🏷️ 매물번호  {property_data['매물번호']}"
-                                },
-                                "annotations": {
-                                    "bold": True,
-                                    "color": "gray"
-                                }
-                            }
-                        ]
-                    },
-                }
-            )
 
         # ── 사진 블록 ──
         if floor_photos and any(
@@ -1578,12 +1545,8 @@ class NotionUploader:
             logger.error(f"노션 블록 추가 실패: {e}")
             return False
 
-    def get_next_property_number(self) -> str:
-        """노션 DB에서 현재 최대 매물번호를 조회해 다음 번호 반환.
-
-        Returns:
-            "N01", "N02" ... "N99", "N100" 형식 문자열
-        """
+    def _get_next_property_number_UNUSED(self) -> str:
+        """(사용하지 않음 - 매물번호 기능 제거됨)"""
         max_num = 0
         has_more = True
         start_cursor = None
@@ -1628,13 +1591,8 @@ class NotionUploader:
             return f"N{next_num:02d}"
         return f"N{next_num}"
 
-    def get_pages_missing_number(self) -> List[Dict]:
-        """매물번호가 없는 페이지 목록을 생성일 오름차순으로 반환.
-
-        Returns:
-            [{"page_id": str, "title": str,
-              "created_time": str, "msg_id": int|None}, ...]
-        """
+    def _get_pages_missing_number_UNUSED(self) -> List[Dict]:
+        """(사용하지 않음 - 매물번호 기능 제거됨)"""
         results = []
         has_more = True
         start_cursor = None
@@ -2151,8 +2109,9 @@ class TelegramNotionBot:
 
     # 앨범 사진 수집 대기 시간 (초)
     MEDIA_GROUP_TIMEOUT = 2.0
-    # 복수 미디어그룹 수집 시간창 (초) - 이 시간 이내 사진들을 같은 매물로 묶음
-    PROPERTY_COLLECT_WINDOW = 120
+    # 복수 미디어그룹 수집 시간창 (초) - 시간 제한 없이 텍스트 매물 설명이 오면 묶음
+    # 매우 긴 시간(30일)으로 설정하여 실질적으로 무제한 대기
+    PROPERTY_COLLECT_WINDOW = 30 * 24 * 60 * 60
     # 저장 대기 버퍼 (초) - 매물 설명 감지 후 이 시간 후에 저장 (실수 삭제 방지)
     PROPERTY_SAVE_BUFFER = 30
 
@@ -2693,7 +2652,7 @@ class TelegramNotionBot:
     @staticmethod
     def _build_notion_section(
         page_url: str, page_id: str, update_log: str = "",
-        use_html: bool = True, property_number: str = "",
+        use_html: bool = True,
     ) -> str:
         """구분선 아래 노션 정보 섹션 생성
 
@@ -2702,18 +2661,16 @@ class TelegramNotionBot:
             page_id: 노션 페이지 ID
             update_log: 수정 이력 문자열
             use_html: True면 HTML 하이퍼링크, False면 plain text
-            property_number: 매물번호 (예: "N01")
         """
-        num_prefix = f"{property_number}  " if property_number else ""
         if use_html:
             section = (
                 f"\n\n{TelegramNotionBot.DIVIDER}\n"
-                f'✅ {num_prefix}<a href="{page_url}">Notion</a>'
+                f'✅ <a href="{page_url}">Notion</a>'
             )
         else:
             section = (
                 f"\n\n{TelegramNotionBot.DIVIDER}\n"
-                f"✅ {num_prefix}Notion\n"
+                f"✅ Notion\n"
                 f"🔗 {page_url}"
             )
         if update_log:
@@ -3773,12 +3730,6 @@ class TelegramNotionBot:
             if staff:
                 property_data["매물접수"] = staff
 
-            # 매물번호 채번
-            property_number = (
-                self.notion_uploader.get_next_property_number()
-            )
-            property_data["매물번호"] = property_number
-
             # 노션 업로드
             page_url, page_id = self.notion_uploader.upload_property(
                 property_data,
@@ -3805,11 +3756,9 @@ class TelegramNotionBot:
             # 원본 메시지에 노션 링크 추가
             notion_html = self._build_notion_section(
                 page_url, page_id, use_html=True,
-                property_number=property_number,
             )
             notion_plain = self._build_notion_section(
                 page_url, page_id, use_html=False,
-                property_number=property_number,
             )
             is_caption = trigger_message.caption is not None
             success = await self._safe_edit_message(
@@ -4312,181 +4261,10 @@ class TelegramNotionBot:
         asyncio.create_task(
             self._recover_features_on_startup()
         )
-        asyncio.create_task(
-            self._recover_property_numbers_on_startup()
-        )
         logger.info(
             f"자동 동기화 태스크 시작 "
             f"(주기: {self.AUTO_SYNC_INTERVAL // 3600}시간)"
         )
-
-    async def _recover_property_numbers_on_startup(self):
-        """봇 시작 시 매물번호 없는 매물에 순서대로 번호 부여 + 텔레그램 메시지 갱신"""
-        await asyncio.sleep(15)
-        logger.info("🔢 매물번호 소급적용 시작...")
-
-        try:
-            pages = (
-                self.notion_uploader.get_pages_missing_number()
-            )
-            if not pages:
-                logger.info("✅ 매물번호 소급 대상 없음")
-                return
-
-            logger.info(
-                f"📋 매물번호 누락 {len(pages)}개 발견"
-            )
-
-            # 현재 최대 번호 이후부터 채번
-            # (get_next_property_number 는 매번 DB 조회하므로
-            #  루프 안에서 호출하면 느림 → 시작값 한 번만 가져오고 직접 증가)
-            start_raw = (
-                self.notion_uploader.get_next_property_number()
-            )
-            # "N01" → 1, "N100" → 100
-            m = re.match(r"N(\d+)$", start_raw)
-            counter = int(m.group(1)) if m else 1
-
-            assigned = 0
-
-            for page_info in pages:
-                page_id = page_info["page_id"]
-                title = page_info.get("title", "?")
-                msg_id = page_info.get("msg_id")
-
-                num_str = (
-                    f"N{counter:02d}"
-                    if counter < 100
-                    else f"N{counter}"
-                )
-
-                try:
-                    # 1) 노션 속성 업데이트
-                    self.notion_uploader.client.pages.update(
-                        page_id=page_id,
-                        properties={
-                            "매물번호": {
-                                "rich_text": [
-                                    {
-                                        "text": {
-                                            "content": num_str
-                                        }
-                                    }
-                                ]
-                            }
-                        },
-                    )
-
-                    # 2) 노션 페이지 본문 최상단에 매물번호 블록 추가 (paragraph 형식 - 노션 검색 가능)
-                    try:
-                        self.notion_uploader.client.blocks.children.append(
-                            block_id=page_id,
-                            children=[
-                                {
-                                    "object": "block",
-                                    "type": "paragraph",
-                                    "paragraph": {
-                                        "rich_text": [
-                                            {
-                                                "text": {
-                                                    "content": f"🏷️ 매물번호  {num_str}"
-                                                },
-                                                "annotations": {
-                                                    "bold": True,
-                                                    "color": "gray"
-                                                }
-                                            }
-                                        ]
-                                    },
-                                }
-                            ],
-                        )
-                    except Exception as be:
-                        logger.warning(
-                            f"  매물번호 블록 추가 실패 ({title}): {be}"
-                        )
-
-                    # 3) 텔레그램 메시지 수정 (DIVIDER 아래 줄 교체)
-                    if msg_id and msg_id in self._page_mapping:
-                        chat_id = self._msg_chat_ids.get(msg_id)
-                        if chat_id:
-                            try:
-                                # 현재 메시지 가져오기는 불가 → 저장된 original 텍스트 활용
-                                orig = self._original_texts.get(
-                                    msg_id, ""
-                                )
-                                if orig:
-                                    page_url = (
-                                        f"https://www.notion.so/"
-                                        f"{page_id.replace('-', '')}"
-                                    )
-                                    notion_html = (
-                                        self._build_notion_section(
-                                            page_url, page_id,
-                                            use_html=True,
-                                            property_number=num_str,
-                                        )
-                                    )
-                                    notion_plain = (
-                                        self._build_notion_section(
-                                            page_url, page_id,
-                                            use_html=False,
-                                            property_number=num_str,
-                                        )
-                                    )
-                                    html_full = (
-                                        html.escape(orig) + notion_html
-                                    )
-                                    try:
-                                        await self._app.bot.edit_message_caption(
-                                            chat_id=chat_id,
-                                            message_id=msg_id,
-                                            caption=html_full,
-                                            parse_mode="HTML",
-                                        )
-                                    except Exception:
-                                        try:
-                                            await self._app.bot.edit_message_text(
-                                                chat_id=chat_id,
-                                                message_id=msg_id,
-                                                text=html_full,
-                                                parse_mode="HTML",
-                                            )
-                                        except Exception:
-                                            plain_full = orig + notion_plain
-                                            try:
-                                                await self._app.bot.edit_message_caption(
-                                                    chat_id=chat_id,
-                                                    message_id=msg_id,
-                                                    caption=plain_full,
-                                                )
-                                            except Exception:
-                                                pass
-                            except Exception as te:
-                                logger.warning(
-                                    f"  텔레그램 메시지 수정 실패 "
-                                    f"({title}): {te}"
-                                )
-
-                    assigned += 1
-                    counter += 1
-                    logger.info(f"  ✅ {num_str} → {title}")
-                    await asyncio.sleep(0.4)
-
-                except Exception as e:
-                    logger.warning(
-                        f"  ⚠️ 번호 부여 실패 ({title}): {e}"
-                    )
-                    continue
-
-            logger.info(
-                f"🔢 매물번호 소급 완료: {assigned}/{len(pages)}개"
-            )
-
-        except Exception as e:
-            logger.error(
-                f"매물번호 소급 오류: {e}", exc_info=True
-            )
 
     async def _recover_features_on_startup(self):
         """봇 시작 시 상가 특징이 비어있는 매물을 원본 메시지에서 복구"""
