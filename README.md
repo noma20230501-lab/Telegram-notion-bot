@@ -58,8 +58,9 @@
 
 3. **필요한 파일들 저장**
    - `telegram_notion_bot.py`
+   - `telegram_notion_bot1.py` (이미지 만료 방지용 Cloudinary 업로드 버전)
    - `requirements.txt`
-   - `.env.example`
+   - `env.example`
 
 4. **라이브러리 설치**
    ```bash
@@ -76,8 +77,8 @@
 
 1. **환경변수 파일 생성**
    ```bash
-   # .env.example을 .env로 복사
-   cp .env.example .env
+   # env.example을 env로 복사 (또는 .env로 만들어도 됨)
+   cp env.example env
    ```
 
 2. **`.env` 파일 편집**
@@ -85,6 +86,9 @@
    TELEGRAM_BOT_TOKEN=1234567890:ABCdefGHIjklMNOpqrsTUVwxyz
    NOTION_TOKEN=secret_ABC123...
    NOTION_DATABASE_ID=a1b2c3d4e5f6...
+   CLOUDINARY_CLOUD_NAME=...
+   CLOUDINARY_API_KEY=...
+   CLOUDINARY_API_SECRET=...
    ```
 
 3. **노션 데이터베이스 속성 확인**
