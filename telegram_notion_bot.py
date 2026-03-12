@@ -10,14 +10,10 @@ import sys
 import html
 import asyncio
 import logging
-import urllib.request
-import urllib.error
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 from pathlib import Path
 
-import cloudinary
-import cloudinary.uploader
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -62,40 +58,6 @@ def _load_env_files() -> None:
 
 # 환경변수 파일 로드
 _load_env_files()
-
-# Cloudinary 설정
-cloudinary.config(
-    cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
-    api_key=os.getenv("CLOUDINARY_API_KEY"),
-    api_secret=os.getenv("CLOUDINARY_API_SECRET"),
-    secure=True,
-)
-
-
-async def upload_to_cloudinary(telegram_url: str) -> str:
-    """텔레그램 임시 URL → Cloudinary 영구 URL로 변환
-
-    Args:
-        telegram_url: api.telegram.org/... 형태의 임시 URL
-    Returns:
-        Cloudinary 영구 URL (실패 시 원본 URL 반환)
-    """
-    try:
-        loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(
-            None,
-            lambda: cloudinary.uploader.upload(
-                telegram_url,
-                folder="noma_realestate",
-                resource_type="image",
-            ),
-        )
-        permanent_url = result.get("secure_url", telegram_url)
-        logger.info(f"Cloudinary 업로드 성공: {permanent_url}")
-        return permanent_url
-    except Exception as e:
-        logger.error(f"Cloudinary 업로드 실패, 원본 URL 사용: {e}")
-        return telegram_url
 
 
 class PropertyParser:
@@ -3908,7 +3870,7 @@ class TelegramNotionBot:
             try:
                 photo = message.photo[-1]
                 photo_file = await photo.get_file()
-                photo_url = await upload_to_cloudinary(photo_file.file_path)
+                photo_url = photo_file.file_path
             except Exception as e:
                 logger.error(f"사진 URL 가져오기 실패: {e}")
                 return
@@ -3954,9 +3916,8 @@ class TelegramNotionBot:
         # 사진 추가 (가장 큰 해상도)
         photo = message.photo[-1]
         photo_file = await photo.get_file()
-        permanent_url = await upload_to_cloudinary(photo_file.file_path)
         self._media_groups[media_group_id]["photos"].append(
-            permanent_url
+            photo_file.file_path
         )
 
         # 캡션이 있으면 저장
@@ -5057,12 +5018,8 @@ if __name__ == "__main__":
     TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
     NOTION_TOKEN = os.getenv("NOTION_TOKEN")
     DATABASE_ID = os.getenv("NOTION_DATABASE_ID")
-    CLOUDINARY_CLOUD_NAME = os.getenv("CLOUDINARY_CLOUD_NAME")
-    CLOUDINARY_API_KEY = os.getenv("CLOUDINARY_API_KEY")
-    CLOUDINARY_API_SECRET = os.getenv("CLOUDINARY_API_SECRET")
 
-    if not all([TELEGRAM_TOKEN, NOTION_TOKEN, DATABASE_ID,
-                CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET]):
+    if not all([TELEGRAM_TOKEN, NOTION_TOKEN, DATABASE_ID]):
         print("=" * 50)
         print("환경변수를 설정해주세요!")
         print("=" * 50)
@@ -5074,12 +5031,6 @@ if __name__ == "__main__":
             missing.append("NOTION_TOKEN")
         if not DATABASE_ID:
             missing.append("NOTION_DATABASE_ID")
-        if not CLOUDINARY_CLOUD_NAME:
-            missing.append("CLOUDINARY_CLOUD_NAME")
-        if not CLOUDINARY_API_KEY:
-            missing.append("CLOUDINARY_API_KEY")
-        if not CLOUDINARY_API_SECRET:
-            missing.append("CLOUDINARY_API_SECRET")
         print(f"누락된 변수: {', '.join(missing)}")
         exit(1)
 
