@@ -70,28 +70,50 @@ def _init_cloudinary() -> bool:
     return True
 
 
-def _upload_to_cloudinary(telegram_file_url: str, folder: str = "real_estate") -> Optional[str]:
+def _make_cloudinary_folder(address: str = "") -> str:
+    """매물 주소를 기반으로 Cloudinary 폴더 경로 생성.
+
+    예: "북구 침산동 105-50 3층" → "부동산/북구_침산동_105-50_3층_26.03.13"
+    주소가 없으면 "부동산/매물_26.03.13" 형태로 생성.
+    """
+    date_str = datetime.now().strftime("%y.%m.%d")
+    if address:
+        # 폴더명에 사용 불가한 문자 제거/치환 (/ : * ? " < > | 공백)
+        safe = re.sub(r'[\\/*?:"<>|]', '', address)   # 특수문자 제거
+        safe = re.sub(r'\s+', '_', safe.strip())        # 공백 → _
+        safe = safe[:50]                                # 최대 50자
+        return f"부동산/{safe}_{date_str}"
+    return f"부동산/매물_{date_str}"
+
+
+def _upload_to_cloudinary(
+    telegram_file_url: str,
+    folder: str = "부동산",
+    index: int = 0,
+) -> Optional[str]:
     """텔레그램 파일 URL을 Cloudinary에 업로드하고 영구 URL 반환.
 
     - 업로드 실패 시 None 반환 (원본 URL 폴백은 호출자가 처리)
-    - public_id는 URL 해시 기반으로 중복 업로드 방지
+    - public_id는 폴더 + 순번 기반으로 순서 보장 및 중복 방지
     """
     if not _CLOUDINARY_AVAILABLE:
         return None
     try:
-        # public_id: URL 해시로 동일 파일 중복 업로드 방지
-        url_hash = hashlib.md5(telegram_file_url.encode()).hexdigest()[:16]
+        # public_id: 폴더경로 + 4자리 순번 → 순서 보장
+        url_hash = hashlib.md5(telegram_file_url.encode()).hexdigest()[:8]
+        public_id = f"{folder}/{index:04d}_{url_hash}"
         result = cloudinary.uploader.upload(
             telegram_file_url,
-            folder=folder,
-            public_id=url_hash,
+            public_id=public_id,
             overwrite=False,          # 이미 있으면 재업로드 스킵
             resource_type="image",
             quality="auto:good",      # 자동 품질 최적화
             fetch_format="auto",      # WebP/AVIF 자동 변환
+            use_filename=False,
+            unique_filename=False,
         )
         secure_url = result.get("secure_url")
-        logger.debug("Cloudinary 업로드 성공: %s", secure_url)
+        logger.debug("Cloudinary 업로드 성공 [%04d]: %s", index, secure_url)
         return secure_url
     except Exception as e:
         logger.warning("Cloudinary 업로드 실패 (원본 URL 사용): %s", e)
@@ -100,36 +122,46 @@ def _upload_to_cloudinary(telegram_file_url: str, folder: str = "real_estate") -
 
 async def _upload_photos_to_cloudinary(
     photo_urls: List[str],
-    folder: str = "real_estate",
+    folder: str = "부동산",
 ) -> List[str]:
-    """사진 URL 목록을 Cloudinary에 비동기 업로드 (ThreadPool 사용).
+    """사진 URL 목록을 Cloudinary에 순서 보장 업로드 (ThreadPool 사용).
 
-    업로드 실패한 사진은 원본 텔레그램 URL 유지.
+    - 텔레그램 전송 순서를 그대로 유지 (index 기반 정렬)
+    - 최대 5개 병렬 업로드로 속도 확보
+    - 업로드 실패한 사진은 원본 텔레그램 URL 유지
     """
     if not _CLOUDINARY_AVAILABLE:
         return photo_urls
 
     loop = asyncio.get_event_loop()
 
-    async def _upload_one(url: str) -> str:
+    async def _upload_one(idx: int, url: str) -> tuple:
+        """(원본인덱스, 결과URL) 반환 → 순서 복원용"""
         result = await loop.run_in_executor(
-            None, _upload_to_cloudinary, url, folder
+            None, _upload_to_cloudinary, url, folder, idx
         )
-        return result if result else url  # 실패 시 원본 URL 유지
+        return idx, (result if result else url)
 
-    # 동시 업로드 (최대 5개씩 병렬 처리로 API 부하 조절)
+    # 최대 5개 병렬 업로드 (API 부하 조절)
     sem = asyncio.Semaphore(5)
 
-    async def _upload_with_sem(url: str) -> str:
+    async def _upload_with_sem(idx: int, url: str) -> tuple:
         async with sem:
-            return await _upload_one(url)
+            return await _upload_one(idx, url)
 
-    results = await asyncio.gather(*[_upload_with_sem(u) for u in photo_urls])
+    # 병렬 업로드 후 원본 인덱스 순서로 정렬하여 순서 보장
+    raw_results = await asyncio.gather(
+        *[_upload_with_sem(i, u) for i, u in enumerate(photo_urls)]
+    )
+    ordered = sorted(raw_results, key=lambda x: x[0])
+    results = [url for _, url in ordered]
+
     uploaded = sum(1 for o, n in zip(photo_urls, results) if o != n)
     logger.info(
-        "Cloudinary 업로드 완료: %d/%d장 성공", uploaded, len(photo_urls)
+        "Cloudinary 업로드 완료: %d/%d장 성공 (폴더: %s)",
+        uploaded, len(photo_urls), folder,
     )
-    return list(results)
+    return results
 
 
 def _load_env_files() -> None:
@@ -2358,6 +2390,8 @@ class TelegramNotionBot:
         # 10장 초과 시 2번째 앨범이 1번째보다 먼저 도착하는 경우 대기
         # {orig_msg_id: [photo_url, photo_url, ...]}
         self._pending_reply_photos: Dict[int, List[str]] = {}
+        # 메시지 ID → Cloudinary 폴더 경로 (추가사진 업로드 시 동일 폴더 사용)
+        self._page_cld_folders: Dict[int, str] = {}
 
         # 매물접수자 이름 목록 (노션 셀렉트 옵션과 일치해야 함)
         self._staff_names = [
@@ -3877,6 +3911,22 @@ class TelegramNotionBot:
             if staff:
                 property_data["매물접수"] = staff
 
+            # ── Cloudinary 업로드: 주소 기반 폴더에 순서 보장 업로드 ──
+            address = property_data.get("주소", "")
+            cld_folder = _make_cloudinary_folder(address)
+
+            if _CLOUDINARY_ENABLED and photo_urls:
+                photo_urls = await _upload_photos_to_cloudinary(
+                    photo_urls, folder=cld_folder
+                )
+            if _CLOUDINARY_ENABLED and floor_photos:
+                for grp in floor_photos:
+                    grp_photos = grp.get("photos", [])
+                    if grp_photos:
+                        grp["photos"] = await _upload_photos_to_cloudinary(
+                            grp_photos, folder=cld_folder
+                        )
+
             # 노션 업로드
             page_url, page_id = self.notion_uploader.upload_property(
                 property_data,
@@ -3890,10 +3940,13 @@ class TelegramNotionBot:
             self._msg_chat_ids[trigger_message.message_id] = (
                 trigger_message.chat_id
             )
+            # Cloudinary 폴더 저장 (추가사진 업로드 시 동일 폴더 사용)
+            self._page_cld_folders[trigger_message.message_id] = cld_folder
             # 첫 사진 메시지 ID도 매핑 저장 (추가사진 답장 시 사진에 답장해도 찾을 수 있게)
             if first_photo_msg and first_photo_msg.message_id != trigger_message.message_id:
                 self._page_mapping[first_photo_msg.message_id] = page_id
                 self._msg_chat_ids[first_photo_msg.message_id] = first_photo_msg.chat_id
+                self._page_cld_folders[first_photo_msg.message_id] = cld_folder
                 logger.debug(
                     f"첫 사진 메시지 매핑 저장: msg_id={first_photo_msg.message_id} → page_id={page_id}"
                 )
@@ -3995,10 +4048,6 @@ class TelegramNotionBot:
                 photo = message.photo[-1]
                 photo_file = await photo.get_file()
                 photo_url = photo_file.file_path
-                # ── Cloudinary 업로드 (텔레그램 임시 URL → 영구 URL 변환) ──
-                if _CLOUDINARY_ENABLED:
-                    uploaded = await _upload_photos_to_cloudinary([photo_url])
-                    photo_url = uploaded[0]
             except Exception as e:
                 logger.error(f"사진 URL 가져오기 실패: {e}")
                 return
@@ -4086,10 +4135,6 @@ class TelegramNotionBot:
         author_sig = group_data.get("author_signature")
         reply_to = group_data.get("reply_to_message")
         chat_id = message.chat_id
-
-        # ── Cloudinary 업로드 (텔레그램 임시 URL → 영구 URL 변환) ──
-        if _CLOUDINARY_ENABLED and photo_urls:
-            photo_urls = await _upload_photos_to_cloudinary(photo_urls)
 
         logger.debug(
             f"_process_media_group: chat={chat_id}, "
@@ -4766,6 +4811,7 @@ class TelegramNotionBot:
                 "page_id": page_id,
                 "chat_id": chat_id,        # 두 번째 앨범 연결용
                 "timer_task": None,
+                "cld_folder": self._page_cld_folders.get(orig_msg_id, "부동산"),
             }
 
         buf = self._extra_photo_buffers[orig_msg_id]
@@ -4804,13 +4850,16 @@ class TelegramNotionBot:
         photos = buf.get("photos", [])
         label = buf.get("label", "추가사진")
         page_id = buf.get("page_id")
+        cld_folder = buf.get("cld_folder", "부동산")
 
         if not photos or not page_id:
             return
 
-        # ── Cloudinary 업로드 (텔레그램 임시 URL → 영구 URL 변환) ──
+        # ── Cloudinary 업로드: 동일 매물 폴더에 순서 보장 업로드 ──
         if _CLOUDINARY_ENABLED:
-            photos = await _upload_photos_to_cloudinary(photos)
+            photos = await _upload_photos_to_cloudinary(
+                photos, folder=cld_folder
+            )
 
         date_str = datetime.now().strftime("%y.%m.%d")
         full_label = f"{label} {date_str}"
