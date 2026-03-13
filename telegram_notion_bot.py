@@ -73,8 +73,9 @@ def _init_cloudinary() -> bool:
 def _make_cloudinary_folder(address: str = "") -> str:
     """매물 주소를 기반으로 Cloudinary 폴더 경로 생성.
 
-    예: "북구 침산동 105-50 3층" → "부동산/북구_침산동_105-50_3층_26.03.13"
-    주소가 없으면 "부동산/매물_26.03.13" 형태로 생성.
+    예: "북구 침산동 105-50 3층" → "real_estate/북구_침산동_105-50_3층_26.03.13"
+    주소가 없으면 "real_estate/매물_26.03.13" 형태로 생성.
+    - 최상위 폴더는 반드시 영문(real_estate) 고정 (한글 최상위 폴더 오인식 방지)
     """
     date_str = datetime.now().strftime("%y.%m.%d")
     if address:
@@ -82,38 +83,39 @@ def _make_cloudinary_folder(address: str = "") -> str:
         safe = re.sub(r'[\\/*?:"<>|]', '', address)   # 특수문자 제거
         safe = re.sub(r'\s+', '_', safe.strip())        # 공백 → _
         safe = safe[:50]                                # 최대 50자
-        return f"부동산/{safe}_{date_str}"
-    return f"부동산/매물_{date_str}"
+        return f"real_estate/{safe}_{date_str}"
+    return f"real_estate/매물_{date_str}"
 
 
 def _upload_to_cloudinary(
     telegram_file_url: str,
-    folder: str = "부동산",
+    folder: str = "real_estate",
     index: int = 0,
 ) -> Optional[str]:
     """텔레그램 파일 URL을 Cloudinary에 업로드하고 영구 URL 반환.
 
     - 업로드 실패 시 None 반환 (원본 URL 폴백은 호출자가 처리)
-    - public_id는 폴더 + 순번 기반으로 순서 보장 및 중복 방지
+    - public_id: 순번_해시 (폴더 경로는 folder 파라미터로만 전달)
     """
     if not _CLOUDINARY_AVAILABLE:
         return None
     try:
-        # public_id: 폴더경로 + 4자리 순번 → 순서 보장
+        # public_id: 순번+해시만 (folder 파라미터와 중복 방지)
         url_hash = hashlib.md5(telegram_file_url.encode()).hexdigest()[:8]
-        public_id = f"{folder}/{index:04d}_{url_hash}"
+        public_id = f"{index:04d}_{url_hash}"
         result = cloudinary.uploader.upload(
             telegram_file_url,
+            folder=folder,            # ← 폴더는 여기서만 지정 (public_id에 중복 X)
             public_id=public_id,
-            overwrite=False,          # 이미 있으면 재업로드 스킵
+            overwrite=False,
             resource_type="image",
-            quality="auto:good",      # 자동 품질 최적화
-            fetch_format="auto",      # WebP/AVIF 자동 변환
+            quality="auto:good",
+            fetch_format="auto",
             use_filename=False,
             unique_filename=False,
         )
         secure_url = result.get("secure_url")
-        logger.debug("Cloudinary 업로드 성공 [%04d]: %s", index, secure_url)
+        logger.debug("Cloudinary 업로드 성공 [%04d] 폴더=%s", index, folder)
         return secure_url
     except Exception as e:
         logger.warning("Cloudinary 업로드 실패 (원본 URL 사용): %s", e)
@@ -122,7 +124,7 @@ def _upload_to_cloudinary(
 
 async def _upload_photos_to_cloudinary(
     photo_urls: List[str],
-    folder: str = "부동산",
+    folder: str = "real_estate",
 ) -> List[str]:
     """사진 URL 목록을 Cloudinary에 순서 보장 업로드 (ThreadPool 사용).
 
@@ -4811,7 +4813,7 @@ class TelegramNotionBot:
                 "page_id": page_id,
                 "chat_id": chat_id,        # 두 번째 앨범 연결용
                 "timer_task": None,
-                "cld_folder": self._page_cld_folders.get(orig_msg_id, "부동산"),
+                "cld_folder": self._page_cld_folders.get(orig_msg_id, "real_estate"),
             }
 
         buf = self._extra_photo_buffers[orig_msg_id]
@@ -4850,7 +4852,7 @@ class TelegramNotionBot:
         photos = buf.get("photos", [])
         label = buf.get("label", "추가사진")
         page_id = buf.get("page_id")
-        cld_folder = buf.get("cld_folder", "부동산")
+        cld_folder = buf.get("cld_folder", "real_estate")
 
         if not photos or not page_id:
             return
