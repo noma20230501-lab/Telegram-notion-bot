@@ -10,6 +10,11 @@ import sys
 import html
 import asyncio
 import logging
+import urllib.request
+import urllib.parse
+import urllib.error
+import hashlib
+import json as _json
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 from pathlib import Path
@@ -26,12 +31,106 @@ from telegram.ext import (
 )
 from notion_client import Client
 
+# ── Cloudinary SDK (선택적 import) ──
+try:
+    import cloudinary
+    import cloudinary.uploader
+    _CLOUDINARY_AVAILABLE = True
+except ImportError:
+    _CLOUDINARY_AVAILABLE = False
+
 # 로깅 설정
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+
+
+# ─────────────────────────────────────────────────────────────
+# Cloudinary 초기화 및 업로드 헬퍼
+# ─────────────────────────────────────────────────────────────
+
+def _init_cloudinary() -> bool:
+    """Cloudinary SDK를 환경변수로 초기화. 성공 여부 반환."""
+    if not _CLOUDINARY_AVAILABLE:
+        return False
+    cloud_name = os.getenv("CLOUDINARY_CLOUD_NAME", "")
+    api_key    = os.getenv("CLOUDINARY_API_KEY", "")
+    api_secret = os.getenv("CLOUDINARY_API_SECRET", "")
+    if not all([cloud_name, api_key, api_secret]):
+        return False
+    cloudinary.config(
+        cloud_name=cloud_name,
+        api_key=api_key,
+        api_secret=api_secret,
+        secure=True,
+    )
+    logger.info("Cloudinary 초기화 완료 (cloud_name=%s)", cloud_name)
+    return True
+
+
+def _upload_to_cloudinary(telegram_file_url: str, folder: str = "real_estate") -> Optional[str]:
+    """텔레그램 파일 URL을 Cloudinary에 업로드하고 영구 URL 반환.
+
+    - 업로드 실패 시 None 반환 (원본 URL 폴백은 호출자가 처리)
+    - public_id는 URL 해시 기반으로 중복 업로드 방지
+    """
+    if not _CLOUDINARY_AVAILABLE:
+        return None
+    try:
+        # public_id: URL 해시로 동일 파일 중복 업로드 방지
+        url_hash = hashlib.md5(telegram_file_url.encode()).hexdigest()[:16]
+        result = cloudinary.uploader.upload(
+            telegram_file_url,
+            folder=folder,
+            public_id=url_hash,
+            overwrite=False,          # 이미 있으면 재업로드 스킵
+            resource_type="image",
+            quality="auto:good",      # 자동 품질 최적화
+            fetch_format="auto",      # WebP/AVIF 자동 변환
+        )
+        secure_url = result.get("secure_url")
+        logger.debug("Cloudinary 업로드 성공: %s", secure_url)
+        return secure_url
+    except Exception as e:
+        logger.warning("Cloudinary 업로드 실패 (원본 URL 사용): %s", e)
+        return None
+
+
+async def _upload_photos_to_cloudinary(
+    photo_urls: List[str],
+    folder: str = "real_estate",
+) -> List[str]:
+    """사진 URL 목록을 Cloudinary에 비동기 업로드 (ThreadPool 사용).
+
+    업로드 실패한 사진은 원본 텔레그램 URL 유지.
+    """
+    if not _CLOUDINARY_AVAILABLE:
+        return photo_urls
+
+    loop = asyncio.get_event_loop()
+
+    async def _upload_one(url: str) -> str:
+        result = await loop.run_in_executor(
+            None, _upload_to_cloudinary, url, folder
+        )
+        return result if result else url  # 실패 시 원본 URL 유지
+
+    # 동시 업로드 (최대 5개씩 병렬 처리로 API 부하 조절)
+    sem = asyncio.Semaphore(5)
+
+    async def _upload_with_sem(url: str) -> str:
+        async with sem:
+            return await _upload_one(url)
+
+    results = await asyncio.gather(*[_upload_with_sem(u) for u in photo_urls])
+    uploaded = sum(1 for o, n in zip(photo_urls, results) if o != n)
+    logger.info(
+        "Cloudinary 업로드 완료: %d/%d장 성공", uploaded, len(photo_urls)
+    )
+    return list(results)
+
 
 def _load_env_files() -> None:
     """환경변수 파일 로드.
@@ -58,6 +157,9 @@ def _load_env_files() -> None:
 
 # 환경변수 파일 로드
 _load_env_files()
+
+# Cloudinary 초기화 (환경변수 로드 후)
+_CLOUDINARY_ENABLED = _init_cloudinary()
 
 
 class PropertyParser:
@@ -1438,15 +1540,37 @@ class NotionUploader:
 
         # 노션 페이지 생성
         try:
+            # Notion API: pages.create 시 children 최대 100개 제한
+            # 100개 초과 블록은 페이지 생성 후 append로 나눠서 추가
+            NOTION_CREATE_LIMIT = 100
+            first_chunk = children[:NOTION_CREATE_LIMIT]
+            overflow_blocks = children[NOTION_CREATE_LIMIT:]
+
             create_kwargs = {
                 "parent": {"database_id": self.database_id},
                 "properties": properties,
             }
-            if children:
-                create_kwargs["children"] = children
+            if first_chunk:
+                create_kwargs["children"] = first_chunk
 
             response = self.client.pages.create(**create_kwargs)
             page_id = response["id"]
+
+            # 100개 초과 블록은 청크 단위로 추가 append
+            if overflow_blocks:
+                chunk_size = 100
+                for i in range(0, len(overflow_blocks), chunk_size):
+                    chunk = overflow_blocks[i: i + chunk_size]
+                    try:
+                        self.client.blocks.children.append(
+                            block_id=page_id,
+                            children=chunk,
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"사진 블록 추가 append 실패 (일부 누락 가능): {e}"
+                        )
+
             # ID만으로 URL 생성 (제목 포함 방지 → 검색 깔끔)
             clean_url = (
                 f"https://www.notion.so/"
@@ -3871,6 +3995,10 @@ class TelegramNotionBot:
                 photo = message.photo[-1]
                 photo_file = await photo.get_file()
                 photo_url = photo_file.file_path
+                # ── Cloudinary 업로드 (텔레그램 임시 URL → 영구 URL 변환) ──
+                if _CLOUDINARY_ENABLED:
+                    uploaded = await _upload_photos_to_cloudinary([photo_url])
+                    photo_url = uploaded[0]
             except Exception as e:
                 logger.error(f"사진 URL 가져오기 실패: {e}")
                 return
@@ -3958,6 +4086,10 @@ class TelegramNotionBot:
         author_sig = group_data.get("author_signature")
         reply_to = group_data.get("reply_to_message")
         chat_id = message.chat_id
+
+        # ── Cloudinary 업로드 (텔레그램 임시 URL → 영구 URL 변환) ──
+        if _CLOUDINARY_ENABLED and photo_urls:
+            photo_urls = await _upload_photos_to_cloudinary(photo_urls)
 
         logger.debug(
             f"_process_media_group: chat={chat_id}, "
@@ -4675,6 +4807,10 @@ class TelegramNotionBot:
 
         if not photos or not page_id:
             return
+
+        # ── Cloudinary 업로드 (텔레그램 임시 URL → 영구 URL 변환) ──
+        if _CLOUDINARY_ENABLED:
+            photos = await _upload_photos_to_cloudinary(photos)
 
         date_str = datetime.now().strftime("%y.%m.%d")
         full_label = f"{label} {date_str}"
