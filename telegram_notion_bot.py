@@ -2961,6 +2961,24 @@ class TelegramNotionBot:
         """채팅 버퍼에 사진 추가 (현재 floor_group의 마지막 그룹에 추가) + 2분 만료 타이머 리셋"""
         buf = self._get_or_create_buffer(chat_id)
 
+        # 작성자가 변경되면 기존 버퍼 초기화 (다른 사람의 사진이 섞이는 것 방지)
+        existing_author = buf.get("author_signature")
+        if (
+            author_sig
+            and existing_author
+            and author_sig != existing_author
+        ):
+            old_photo_count = sum(
+                len(g.get("photos", []))
+                for g in buf.get("floor_groups", [])
+            )
+            logger.info(
+                f"작성자 변경 감지: '{existing_author}' → '{author_sig}', "
+                f"기존 버퍼 초기화 (사진 {old_photo_count}장 폐기, chat_id={chat_id})"
+            )
+            self._clear_chat_buffer(chat_id)
+            buf = self._get_or_create_buffer(chat_id)
+
         # floor_groups 마지막 그룹에 사진 추가
         floor_groups = buf.setdefault(
             "floor_groups", [{"label": None, "photos": []}]
@@ -2969,7 +2987,7 @@ class TelegramNotionBot:
 
         if buf["first_message"] is None:
             buf["first_message"] = message
-        if author_sig and not buf.get("author_signature"):
+        if author_sig:
             buf["author_signature"] = author_sig
         # 기존 만료 태스크 취소 후 재시작
         existing = self._collect_tasks.get(chat_id)
@@ -3138,9 +3156,26 @@ class TelegramNotionBot:
         # 버퍼에서 사진 & 층별 그룹 가져오기
         buf = self._chat_buffers.get(chat_id, {})
         floor_groups = buf.get("floor_groups", [])
-        author_sig = buf.get("author_signature") or getattr(
+        buf_author = buf.get("author_signature")
+        trigger_author = getattr(
             trigger_message, "author_signature", None
         )
+        author_sig = buf_author or trigger_author
+
+        # 작성자 불일치 시 버퍼 사진 사용하지 않음
+        # (텍스트만 올린 매물 설명의 작성자 ≠ 사진 작성자)
+        if (
+            buf_author
+            and trigger_author
+            and buf_author != trigger_author
+        ):
+            logger.warning(
+                f"매물 저장 시 작성자 불일치: 사진='{buf_author}', "
+                f"매물설명='{trigger_author}' → 버퍼 사진 제외 (chat_id={chat_id})"
+            )
+            floor_groups = []
+            author_sig = trigger_author
+
         # 첫 사진 메시지 (추가사진 답장 탐색에 사용)
         first_photo_msg = buf.get("first_message")
 
