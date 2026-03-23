@@ -1056,8 +1056,8 @@ class NotionUploader:
             # 지하층이 없을 때만 지상층 파싱 (오탐 방지를 위해 지하 표현 제거 후 처리)
             주소_지상 = re.sub(r'(?:지하\s*|-\s*)\d+\s*층', '', 주소)
 
-            # 1. 범위 형식 우선: "1~3층", "1-3층"
-            범위_match = re.search(r'(\d+)[~\-](\d+)층', 주소_지상)
+            # 1. 범위 형식 우선: "1~3층", "1-3층", "1층~4층", "1층-4층"
+            범위_match = re.search(r'(\d+)\s*층?\s*[~\-]\s*(\d+)\s*층', 주소_지상)
             if 범위_match:
                 start = int(범위_match.group(1))
                 end = int(범위_match.group(2))
