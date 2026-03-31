@@ -8,6 +8,7 @@ import os
 import re
 import sys
 import html
+import time
 import asyncio
 import logging
 import urllib.request
@@ -993,9 +994,58 @@ class PropertyParser:
 class NotionUploader:
     """노션 업로드 클래스"""
 
+    RETRYABLE_KEYWORDS = [
+        "rate_limit", "rate limit", "429",
+        "500", "502", "503", "504",
+        "timeout", "timed out",
+        "connection", "connect",
+        "internal server error",
+        "service_unavailable", "service unavailable",
+        "gateway", "conflict",
+        "overloaded", "temporarily",
+    ]
+
     def __init__(self, notion_token: str, database_id: str):
         self.client = Client(auth=notion_token)
         self.database_id = database_id
+
+    def _notion_api_call_with_retry(
+        self, func, *args, max_retries: int = 3, label: str = "", **kwargs
+    ):
+        """Notion API 호출을 지수 백오프로 재시도.
+
+        Args:
+            func: 호출할 Notion API 함수
+            max_retries: 최대 재시도 횟수 (기본 3회)
+            label: 로그에 표시할 작업 이름
+
+        Returns:
+            API 호출 결과
+
+        Raises:
+            재시도 불가 에러 또는 max_retries 초과 시 원본 예외
+        """
+        last_exc = None
+        for attempt in range(max_retries + 1):
+            try:
+                return func(*args, **kwargs)
+            except Exception as e:
+                last_exc = e
+                if attempt == max_retries:
+                    break
+                err = str(e).lower()
+                is_retryable = any(
+                    kw in err for kw in self.RETRYABLE_KEYWORDS
+                )
+                if not is_retryable:
+                    break
+                wait = 2 ** (attempt + 1)
+                logger.warning(
+                    f"Notion API 재시도 {attempt + 1}/{max_retries} "
+                    f"({wait}초 후, {label}): {e}"
+                )
+                time.sleep(wait)
+        raise last_exc
 
     def ensure_sync_properties(self):
         """동기화에 필요한 Notion 속성 생성 (없으면 추가)"""
@@ -1587,7 +1637,11 @@ class NotionUploader:
             if first_chunk:
                 create_kwargs["children"] = first_chunk
 
-            response = self.client.pages.create(**create_kwargs)
+            response = self._notion_api_call_with_retry(
+                self.client.pages.create,
+                label="pages.create",
+                **create_kwargs,
+            )
             page_id = response["id"]
 
             # 100개 초과 블록은 청크 단위로 추가 append
@@ -1596,7 +1650,9 @@ class NotionUploader:
                 for i in range(0, len(overflow_blocks), chunk_size):
                     chunk = overflow_blocks[i: i + chunk_size]
                     try:
-                        self.client.blocks.children.append(
+                        self._notion_api_call_with_retry(
+                            self.client.blocks.children.append,
+                            label="blocks.append",
                             block_id=page_id,
                             children=chunk,
                         )
@@ -1633,10 +1689,12 @@ class NotionUploader:
         )
 
         try:
-            self.client.pages.update(
-                page_id=page_id, properties=properties
+            self._notion_api_call_with_retry(
+                self.client.pages.update,
+                label="pages.update",
+                page_id=page_id,
+                properties=properties,
             )
-            # ID만으로 URL 생성 (제목 포함 방지)
             return (
                 f"https://www.notion.so/"
                 f"{page_id.replace('-', '')}"
@@ -3096,6 +3154,38 @@ class TelegramNotionBot:
         await asyncio.sleep(self.PROPERTY_SAVE_BUFFER)
         self._save_tasks.pop(chat_id, None)
 
+        try:
+            await self._do_save_with_buffer_inner(
+                chat_id, description, trigger_message, bot,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(
+                f"매물 저장 태스크 예외 (chat_id={chat_id}): {e}",
+                exc_info=True,
+            )
+            error_msg = (
+                f"❌ 매물 저장 중 예기치 않은 오류!\n"
+                f"📍 {description[:50]}...\n"
+                f"⚠️ {str(e)[:200]}\n\n"
+                f"💡 이 매물은 노션에 등록되지 않았을 수 있습니다."
+            )
+            try:
+                await bot.send_message(chat_id, error_msg)
+            except Exception:
+                logger.error(
+                    "에러 알림 전송도 실패 - 매물 저장 완전 실패"
+                )
+
+    async def _do_save_with_buffer_inner(
+        self,
+        chat_id: int,
+        description: str,
+        trigger_message,
+        bot,
+    ):
+        """_do_save_with_buffer의 실제 로직"""
         # 트리거 메시지(매물 설명) 존재 확인 (30초 이내 삭제 시 저장 취소)
         exists = await self._check_message_exists(
             bot, trigger_message.chat_id, trigger_message.message_id
@@ -4052,10 +4142,24 @@ class TelegramNotionBot:
 
         except Exception as e:
             logger.error(f"매물 저장 오류: {e}", exc_info=True)
-            try:
-                await trigger_message.reply_text(f"❌ 오류 발생: {str(e)}")
-            except Exception:
-                pass
+            error_msg = (
+                f"❌ 매물 저장 실패!\n"
+                f"📍 {description[:50]}...\n"
+                f"⚠️ {str(e)[:200]}\n\n"
+                f"💡 이 매물은 노션에 등록되지 않았습니다.\n"
+                f"원본 메시지를 삭제 후 다시 올려주세요."
+            )
+            for retry_i in range(3):
+                try:
+                    await trigger_message.reply_text(error_msg)
+                    break
+                except Exception as notify_err:
+                    logger.error(
+                        f"에러 알림 전송 실패 "
+                        f"(시도 {retry_i + 1}/3): {notify_err}"
+                    )
+                    if retry_i < 2:
+                        await asyncio.sleep(2)
 
     # ──────────────────────────────────────────────
     # 사진 메시지 처리
@@ -4282,7 +4386,7 @@ class TelegramNotionBot:
         """텔레그램 메시지 존재 여부를 비파괴적으로 확인
 
         edit_message_reply_markup 호출 결과로 판별:
-        - 메시지 존재: 'not modified' 에러 → True
+        - 메시지 존재: 'not modified' / 'no reply_markup' 에러 → True
         - 메시지 삭제됨: 'not found' 에러 → False
         """
         try:
@@ -4290,19 +4394,17 @@ class TelegramNotionBot:
                 chat_id=chat_id,
                 message_id=message_id,
             )
-            # 성공 시 → 메시지 존재 (리플라이 마크업 변경됨)
             return True
         except Exception as e:
             err = str(e).lower()
-            if "not found" in err or "message to edit" in err:
-                return False
+            if "there is no reply_markup" in err:
+                return True
             if "not modified" in err:
                 return True
             if "message can't be edited" in err:
                 return True
-            if "there is no reply_markup" in err:
-                return True
-            # 네트워크 에러 등 → 안전하게 존재한다고 가정
+            if "not found" in err:
+                return False
             logger.warning(
                 f"메시지 존재 확인 불확실 "
                 f"(chat={chat_id}, msg={message_id}): {e}"
