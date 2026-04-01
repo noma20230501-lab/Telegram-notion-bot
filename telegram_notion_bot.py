@@ -4387,7 +4387,8 @@ class TelegramNotionBot:
 
         edit_message_reply_markup 호출 결과로 판별:
         - 메시지 존재: 'not modified' / 'no reply_markup' 에러 → True
-        - 메시지 삭제됨: 'not found' 에러 → False
+        - 메시지 삭제됨: 'message.*not found' 에러 → False
+        - 채팅 접근 불가: 'chat not found' 등 → True (안전 처리)
         """
         try:
             await bot.edit_message_reply_markup(
@@ -4403,7 +4404,15 @@ class TelegramNotionBot:
                 return True
             if "message can't be edited" in err:
                 return True
-            if "not found" in err:
+            if "chat not found" in err:
+                logger.warning(
+                    f"채팅 접근 불가 (삭제 아님으로 처리) "
+                    f"(chat={chat_id}, msg={message_id}): {e}"
+                )
+                return True
+            if "message" in err and "not found" in err:
+                return False
+            if "message_id_invalid" in err:
                 return False
             logger.warning(
                 f"메시지 존재 확인 불확실 "
@@ -4470,6 +4479,8 @@ class TelegramNotionBot:
                 f"메모리 {result['memory_count']}개)"
             )
 
+            # 1차 패스: 삭제 대상 후보만 수집 (아직 실제 삭제 안 함)
+            delete_candidates = []
             for page_info in tracked_pages:
                 page_id = page_info["page_id"]
                 chat_id = page_info["chat_id"]
@@ -4478,37 +4489,61 @@ class TelegramNotionBot:
 
                 result["checked"] += 1
 
-                # 메시지 존재 여부 확인
                 exists = await self._check_message_exists(
                     bot, chat_id, msg_id
                 )
 
                 if not exists:
-                    # 텔레그램에서 삭제됨 → 노션 아카이브
-                    try:
-                        self.notion_uploader.archive_property(
-                            page_id
-                        )
-                        result["archived"] += 1
-                        result["archived_titles"].append(title)
-
-                        # 메모리 매핑도 정리
-                        self._page_mapping.pop(msg_id, None)
-                        self._original_texts.pop(msg_id, None)
-                        self._msg_chat_ids.pop(msg_id, None)
-
-                        logger.info(
-                            f"동기화 삭제: '{title}' "
-                            f"(msg_id={msg_id})"
-                        )
-                    except Exception as e:
-                        logger.error(
-                            f"동기화 아카이브 실패 "
-                            f"'{title}': {e}"
-                        )
+                    delete_candidates.append(page_info)
 
                 # API 속도 제한 방지 (0.5초 간격)
                 await asyncio.sleep(0.5)
+
+            # ── 대량 삭제 안전장치 ──
+            # 전체 매물의 30% 초과 삭제 시 오동작으로 간주하고 중단
+            total = len(tracked_pages)
+            delete_count = len(delete_candidates)
+            MASS_DELETE_THRESHOLD = 0.30  # 30%
+            if (
+                total >= 5
+                and delete_count > total * MASS_DELETE_THRESHOLD
+            ):
+                logger.error(
+                    f"⛔ 대량 삭제 차단: 전체 {total}개 중 "
+                    f"{delete_count}개 삭제 시도 "
+                    f"({delete_count/total*100:.0f}%) "
+                    f"→ 오동작 의심으로 동기화 중단. "
+                    f"수동으로 /동기화 실행하거나 로그를 확인하세요."
+                )
+                result["blocked"] = True
+                result["block_reason"] = (
+                    f"전체 {total}개 중 {delete_count}개({delete_count/total*100:.0f}%) 삭제 시도 → 안전장치 작동"
+                )
+                return result
+
+            # 2차 패스: 실제 아카이브 처리
+            for page_info in delete_candidates:
+                page_id = page_info["page_id"]
+                msg_id = page_info["msg_id"]
+                title = page_info["title"] or "제목 없음"
+                try:
+                    self.notion_uploader.archive_property(page_id)
+                    result["archived"] += 1
+                    result["archived_titles"].append(title)
+
+                    self._page_mapping.pop(msg_id, None)
+                    self._original_texts.pop(msg_id, None)
+                    self._msg_chat_ids.pop(msg_id, None)
+
+                    logger.info(
+                        f"동기화 삭제: '{title}' "
+                        f"(msg_id={msg_id})"
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"동기화 아카이브 실패 "
+                        f"'{title}': {e}"
+                    )
 
             logger.info(
                 f"동기화 완료: {result['checked']}개 확인, "
@@ -4540,7 +4575,8 @@ class TelegramNotionBot:
             f"메모리 추적 매물: {mem_count}개\n"
             "노션 DB를 조회하고 텔레그램 메시지 존재 여부를 "
             "확인합니다.\n"
-            "(매물 수에 따라 시간이 걸릴 수 있습니다)"
+            "(매물 수에 따라 시간이 걸릴 수 있습니다)\n"
+            "⚠️ 전체의 30% 초과 삭제 감지 시 자동 차단됩니다."
         )
 
         try:
@@ -4548,6 +4584,16 @@ class TelegramNotionBot:
                 context.bot,
                 report_chat_id=message.chat_id,
             )
+
+            # 대량 삭제 안전장치 작동 시 경고
+            if result.get("blocked"):
+                await status_msg.edit_text(
+                    f"⛔ 동기화 안전장치 작동!\n\n"
+                    f"{result.get('block_reason', '')}\n\n"
+                    f"봇이 채널에 접근하지 못하거나 네트워크 오류일 수 있습니다.\n"
+                    f"봇 상태를 확인 후 다시 시도해 주세요."
+                )
+                return
 
             # 결과 메시지 생성
             report = (
@@ -4594,18 +4640,14 @@ class TelegramNotionBot:
             )
 
     async def _post_init(self, application):
-        """봇 초기화 후 자동 동기화 백그라운드 태스크 시작"""
+        """봇 초기화 후 백그라운드 태스크 시작"""
         self._app = application
-        asyncio.create_task(
-            self._auto_sync_loop(application)
-        )
+        # 자동 동기화 비활성화 (오동작으로 인한 대량 삭제 방지)
+        # 삭제가 필요한 경우 /delete 또는 /동기화 명령어를 직접 사용하세요.
         asyncio.create_task(
             self._recover_features_on_startup()
         )
-        logger.info(
-            f"자동 동기화 태스크 시작 "
-            f"(주기: {self.AUTO_SYNC_INTERVAL // 3600}시간)"
-        )
+        logger.info("자동 동기화 비활성화됨 (수동 /동기화 명령어 사용)")
 
     async def _recover_features_on_startup(self):
         """봇 시작 시 상가 특징이 비어있는 매물을 원본 메시지에서 복구"""
@@ -4713,7 +4755,12 @@ class TelegramNotionBot:
                 result = await self._sync_deleted_properties(
                     application.bot
                 )
-                if result["archived"] > 0:
+                if result.get("blocked"):
+                    logger.error(
+                        f"⛔ 자동 동기화 안전장치 작동 → "
+                        f"{result.get('block_reason', '')}"
+                    )
+                elif result["archived"] > 0:
                     logger.info(
                         f"⏰ 자동 동기화: "
                         f"{result['archived']}개 매물 삭제됨"
