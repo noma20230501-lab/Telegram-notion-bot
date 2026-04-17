@@ -1263,65 +1263,24 @@ class NotionUploader:
             if map_addr and '대구' not in map_addr:
                 map_addr = f"대구 {map_addr}"
             if map_addr:
-                q = urllib.parse.quote(map_addr)
-                naver_url = f"https://map.naver.com/p/search/{q}"
-
-                # 좌표 먼저 확보 (거리뷰 URL + 정적 지도에 공통 사용)
-                coords = _naver_geocode(map_addr)
-                streetview_url = None
-                if coords:
-                    lng, lat = coords
-                    # 네이버 지도 거리뷰(파노라마) URL
-                    streetview_url = (
-                        f"https://map.naver.com/p/search/{q}"
-                        f"?c={lng},{lat},17,0,0,0,dh"
-                        f"&p={lng},{lat},0,0,0,Float"
-                    )
-
-                # 정적 지도 이미지(Cloudinary) URL
-                map_image_url = get_property_map_url(map_addr)
-
-                # ── 🗺️ 네이버지도 : 한 줄에 3개 링크 ──
-                rich_text_parts = [
-                    {
-                        "type": "text",
-                        "text": {
-                            "content": "🟢 네이버지도 열기",
-                            "link": {"url": naver_url},
-                        },
-                    }
-                ]
-                if map_image_url:
-                    rich_text_parts.append(
-                        {"type": "text", "text": {"content": " / "}}
-                    )
-                    rich_text_parts.append(
-                        {
-                            "type": "text",
-                            "text": {
-                                "content": "🖼️ 간이지도",
-                                "link": {"url": map_image_url},
-                            },
-                        }
-                    )
-                if streetview_url:
-                    rich_text_parts.append(
-                        {"type": "text", "text": {"content": " / "}}
-                    )
-                    rich_text_parts.append(
-                        {
-                            "type": "text",
-                            "text": {
-                                "content": "🚶 거리뷰",
-                                "link": {"url": streetview_url},
-                            },
-                        }
-                    )
+                naver_url = (
+                    f"https://map.naver.com/p/search/"
+                    f"{urllib.parse.quote(map_addr)}"
+                )
                 properties["🗺️ 네이버지도"] = {
-                    "rich_text": rich_text_parts
+                    "rich_text": [
+                        {
+                            "type": "text",
+                            "text": {
+                                "content": "🟢 네이버지도 열기",
+                                "link": {"url": naver_url},
+                            },
+                        }
+                    ]
                 }
 
-                # ── 🗺️ 지도 (files) : 정적 지도 이미지 (선택적 인라인 표시용) ──
+                # ── 🗺️ 지도 (files) : 네이버 정적 지도 이미지 ──
+                map_image_url = get_property_map_url(map_addr)
                 if map_image_url:
                     properties["🗺️ 지도"] = {
                         "files": [
