@@ -1253,11 +1253,11 @@ class NotionUploader:
             if map_addr and '대구' not in map_addr:
                 map_addr = f"대구 {map_addr}"
             if map_addr:
-                kakao_url = (
-                    f"https://map.kakao.com/?q="
+                naver_url = (
+                    f"https://map.naver.com/p/search/"
                     f"{urllib.parse.quote(map_addr)}"
                 )
-                properties["🗺️ 카카오맵"] = {"url": kakao_url}
+                properties["🗺️ 네이버지도"] = {"url": naver_url}
 
                 # ── 🗺️ 지도 (files) : 네이버 정적 지도 이미지 ──
                 map_image_url = get_property_map_url(map_addr)
