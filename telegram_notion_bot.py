@@ -245,8 +245,8 @@ def _naver_geocode(address: str) -> Optional[tuple]:
 def _naver_static_map_bytes(
     lng: str,
     lat: str,
-    width: int = 600,
-    height: int = 400,
+    width: int = 1024,
+    height: int = 640,
     level: int = 15,
 ) -> Optional[bytes]:
     """네이버 정적 지도 이미지(PNG) 바이트 반환. 실패 시 None."""
