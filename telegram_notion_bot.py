@@ -247,7 +247,7 @@ def _naver_static_map_bytes(
     lat: str,
     width: int = 600,
     height: int = 400,
-    level: int = 16,
+    level: int = 14,
 ) -> Optional[bytes]:
     """네이버 정적 지도 이미지(PNG) 바이트 반환. 실패 시 None."""
     if not _NAVER_MAP_ENABLED:
