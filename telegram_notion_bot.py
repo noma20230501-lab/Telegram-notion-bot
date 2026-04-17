@@ -197,6 +197,143 @@ _load_env_files()
 _CLOUDINARY_ENABLED = _init_cloudinary()
 
 
+# ─────────────────────────────────────────────────────────────
+# 네이버 지도 API (주소 → 좌표 변환 + 정적 지도 이미지 생성)
+# ─────────────────────────────────────────────────────────────
+
+_NAVER_MAP_CLIENT_ID = os.getenv("NAVER_MAP_CLIENT_ID", "")
+_NAVER_MAP_CLIENT_SECRET = os.getenv("NAVER_MAP_CLIENT_SECRET", "")
+_NAVER_MAP_ENABLED = bool(
+    _NAVER_MAP_CLIENT_ID and _NAVER_MAP_CLIENT_SECRET
+)
+if _NAVER_MAP_ENABLED:
+    logger.info("네이버 지도 API 초기화 완료")
+
+
+def _naver_geocode(address: str) -> Optional[tuple]:
+    """주소 → (경도, 위도) 문자열 튜플. 실패 시 None."""
+    if not _NAVER_MAP_ENABLED or not address:
+        return None
+    try:
+        url = (
+            "https://naveropenapi.apigw.ntruss.com"
+            "/map-geocode/v2/geocode"
+            f"?query={urllib.parse.quote(address)}"
+        )
+        req = urllib.request.Request(
+            url,
+            headers={
+                "X-NCP-APIGW-API-KEY-ID": _NAVER_MAP_CLIENT_ID,
+                "X-NCP-APIGW-API-KEY": _NAVER_MAP_CLIENT_SECRET,
+            },
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = _json.loads(resp.read().decode("utf-8"))
+        addresses = data.get("addresses", [])
+        if not addresses:
+            logger.warning(
+                "네이버 지오코딩 결과 없음: %s", address
+            )
+            return None
+        first = addresses[0]
+        return (first["x"], first["y"])
+    except Exception as e:
+        logger.warning("네이버 지오코딩 실패(%s): %s", address, e)
+        return None
+
+
+def _naver_static_map_bytes(
+    lng: str,
+    lat: str,
+    width: int = 600,
+    height: int = 400,
+    level: int = 16,
+) -> Optional[bytes]:
+    """네이버 정적 지도 이미지(PNG) 바이트 반환. 실패 시 None."""
+    if not _NAVER_MAP_ENABLED:
+        return None
+    try:
+        url = (
+            "https://naveropenapi.apigw.ntruss.com"
+            "/map-static/v2/raster"
+            f"?w={width}&h={height}"
+            f"&center={lng},{lat}"
+            f"&level={level}"
+            f"&markers=type:d|size:mid|pos:{lng}%20{lat}"
+            f"&lang=ko"
+        )
+        req = urllib.request.Request(
+            url,
+            headers={
+                "X-NCP-APIGW-API-KEY-ID": _NAVER_MAP_CLIENT_ID,
+                "X-NCP-APIGW-API-KEY": _NAVER_MAP_CLIENT_SECRET,
+            },
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.read()
+    except Exception as e:
+        logger.warning("네이버 정적 지도 다운로드 실패: %s", e)
+        return None
+
+
+def _upload_map_to_cloudinary(
+    image_bytes: bytes, address: str
+) -> Optional[str]:
+    """지도 이미지 bytes를 Cloudinary에 업로드, secure_url 반환."""
+    if not _CLOUDINARY_AVAILABLE:
+        return None
+    try:
+        import io
+        safe = re.sub(r'[\\/*?:"<>|]', '', address)
+        safe = re.sub(r'\s+', '_', safe.strip())[:50]
+        url_hash = hashlib.md5(address.encode()).hexdigest()[:8]
+        public_id = f"map_{safe}_{url_hash}"
+        result = cloudinary.uploader.upload(
+            io.BytesIO(image_bytes),
+            folder="real_estate/maps",
+            public_id=public_id,
+            overwrite=True,
+            resource_type="image",
+        )
+        return result.get("secure_url")
+    except Exception as e:
+        logger.warning("지도 Cloudinary 업로드 실패: %s", e)
+        return None
+
+
+# 동일 주소 재조회 시 불필요한 API 호출 방지 (간단 메모리 캐시)
+_MAP_URL_CACHE: Dict[str, str] = {}
+
+
+def get_property_map_url(address: str) -> Optional[str]:
+    """매물 주소 → 네이버 지도 이미지 Cloudinary URL.
+
+    전체 흐름:
+      1) 주소 → 위/경도 변환 (네이버 Geocoding)
+      2) 정적 지도 PNG 다운로드 (네이버 Static Map)
+      3) Cloudinary 업로드 후 영구 URL 반환
+
+    네이버/클라우디너리 중 하나라도 미설정이면 None.
+    """
+    if not address:
+        return None
+    if address in _MAP_URL_CACHE:
+        return _MAP_URL_CACHE[address]
+    if not _NAVER_MAP_ENABLED or not _CLOUDINARY_ENABLED:
+        return None
+    coords = _naver_geocode(address)
+    if not coords:
+        return None
+    lng, lat = coords
+    img_bytes = _naver_static_map_bytes(lng, lat)
+    if not img_bytes:
+        return None
+    url = _upload_map_to_cloudinary(img_bytes, address)
+    if url:
+        _MAP_URL_CACHE[address] = url
+    return url
+
+
 class PropertyParser:
     """매물 정보 파싱 클래스"""
 
@@ -1093,6 +1230,47 @@ class NotionUploader:
             properties["주소 및 상호"] = {
                 "title": [{"text": {"content": "매물"}}]
             }
+
+        # ── 🗺️ 카카오맵 (url) ──
+        # 주소에서 "구 + 동/가/로/길 + 번지"까지만 추출해서 검색 URL 생성
+        # (층/일부/상호명은 검색 정확도를 떨어뜨리므로 제외)
+        주소_원본 = property_data.get("주소", "")
+        if 주소_원본:
+            map_src = re.split(r'[\(（]', 주소_원본)[0].strip()
+            addr_match = re.search(
+                r'^(.+?(?:동|가|로|길)\d*\s+\d+(?:-\d+)?)',
+                map_src,
+            )
+            if addr_match:
+                map_addr = addr_match.group(1).strip()
+            else:
+                map_addr = map_src
+                층_match = re.search(
+                    r'(?:지하\s*|-\s*)?\d+\s*층', map_addr
+                )
+                if 층_match:
+                    map_addr = map_addr[:층_match.start()].strip()
+            if map_addr and '대구' not in map_addr:
+                map_addr = f"대구 {map_addr}"
+            if map_addr:
+                naver_url = (
+                    f"https://map.naver.com/p/search/"
+                    f"{urllib.parse.quote(map_addr)}"
+                )
+                properties["🗺️ 네이버지도"] = {"url": naver_url}
+
+                # ── 🗺️ 지도 (files) : 네이버 정적 지도 이미지 ──
+                map_image_url = get_property_map_url(map_addr)
+                if map_image_url:
+                    properties["🗺️ 지도"] = {
+                        "files": [
+                            {
+                                "type": "external",
+                                "name": f"지도_{map_addr}",
+                                "external": {"url": map_image_url},
+                            }
+                        ]
+                    }
 
         # ── 층수 (multi_select) ──
         주소 = property_data.get("주소", "")
