@@ -216,7 +216,7 @@ def _naver_geocode(address: str) -> Optional[tuple]:
         return None
     try:
         url = (
-            "https://naveropenapi.apigw.ntruss.com"
+            "https://maps.apigw.ntruss.com"
             "/map-geocode/v2/geocode"
             f"?query={urllib.parse.quote(address)}"
         )
@@ -254,7 +254,7 @@ def _naver_static_map_bytes(
         return None
     try:
         url = (
-            "https://naveropenapi.apigw.ntruss.com"
+            "https://maps.apigw.ntruss.com"
             "/map-static/v2/raster"
             f"?w={width}&h={height}"
             f"&center={lng},{lat}"
