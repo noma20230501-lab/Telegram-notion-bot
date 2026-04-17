@@ -1257,7 +1257,17 @@ class NotionUploader:
                     f"https://map.naver.com/p/search/"
                     f"{urllib.parse.quote(map_addr)}"
                 )
-                properties["🗺️ 네이버지도"] = {"url": naver_url}
+                properties["🗺️ 네이버지도"] = {
+                    "rich_text": [
+                        {
+                            "type": "text",
+                            "text": {
+                                "content": "📍 위치 보기",
+                                "link": {"url": naver_url},
+                            },
+                        }
+                    ]
+                }
 
                 # ── 🗺️ 지도 (files) : 네이버 정적 지도 이미지 ──
                 map_image_url = get_property_map_url(map_addr)
