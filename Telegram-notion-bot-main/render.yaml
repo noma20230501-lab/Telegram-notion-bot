@@ -1,0 +1,13 @@
+services:
+  - type: worker
+    name: telegram-notion-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python telegram_notion_bot.py
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: NOTION_TOKEN
+        sync: false
+      - key: NOTION_DATABASE_ID
+        sync: false

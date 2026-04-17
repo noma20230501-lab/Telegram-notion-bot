@@ -1,0 +1,16 @@
+# Fly.io 배포 설정 파일
+app = "telegram-notion-bot"
+primary_region = "nrt"  # Tokyo (가장 가까운 리전)
+
+[build]
+
+[env]
+  # 환경변수는 fly secrets set 명령어로 별도 설정
+
+[processes]
+  app = "python telegram_notion_bot.py"
+
+[[vm]]
+  memory = '256mb'
+  cpu_kind = 'shared'
+  cpus = 1
