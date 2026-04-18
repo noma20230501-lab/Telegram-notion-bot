@@ -11,3 +11,14 @@ services:
         sync: false
       - key: NOTION_DATABASE_ID
         sync: false
+      # (선택) 개인 관리자용 노션 DB ID
+      # 설정 시 공유 DB + 개인 DB에 동시 기록됨
+      - key: PRIVATE_NOTION_DATABASE_ID
+        sync: false
+      # Cloudinary (사진 영구 저장, 선택)
+      - key: CLOUDINARY_CLOUD_NAME
+        sync: false
+      - key: CLOUDINARY_API_KEY
+        sync: false
+      - key: CLOUDINARY_API_SECRET
+        sync: false

@@ -86,10 +86,26 @@
    TELEGRAM_BOT_TOKEN=1234567890:ABCdefGHIjklMNOpqrsTUVwxyz
    NOTION_TOKEN=secret_ABC123...
    NOTION_DATABASE_ID=a1b2c3d4e5f6...
+
+   # (선택) 개인(관리자 전용) 노션 DB ID
+   # 설정 시 공유 DB + 개인 DB에 동시 저장되어 직원과 별개로 관리 가능
+   PRIVATE_NOTION_DATABASE_ID=
+
    CLOUDINARY_CLOUD_NAME=...
    CLOUDINARY_API_KEY=...
    CLOUDINARY_API_SECRET=...
    ```
+
+   ### 🔒 개인 DB 이중 기록 (선택 기능)
+   직원은 공유 DB(게스트)로 보고, 관리자만 별도 개인 DB로 보고 싶을 때 사용합니다.
+
+   1. 노션에서 기존 공유 DB를 `···` → **복제(콘텐츠 포함)** 로 복사 → 개인 페이지로 이동
+   2. 복제한 DB에 **동일한 Integration** (`부동산봇` 등)을 추가 연결
+      - DB 페이지 → `···` → **연결** → **연결 추가하기** → Integration 선택
+   3. 복제한 DB의 URL에서 32자리 ID 복사 → `.env`의 `PRIVATE_NOTION_DATABASE_ID`에 설정
+   4. 봇 재시작 → 이후 신규 등록/수정/삭제/거래완료/추가사진이 양쪽 DB에 자동 반영
+   - 매핑은 `page_pair_mapping.json`에 보존 (Git 무시 대상)
+   - 개인 DB 저장 실패는 공유 DB를 막지 않음 (fail-soft). 로그에 경고만 남김
 
 3. **노션 데이터베이스 속성 확인**
    

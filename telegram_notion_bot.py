@@ -1982,6 +1982,22 @@ class NotionUploader:
             logger.error(f"노션 블록 추가 실패: {e}")
             return False
 
+    def update_page_raw_properties(
+        self, page_id: str, properties: Dict
+    ) -> bool:
+        """페이지 속성만 직접 업데이트 (low-level 헬퍼).
+
+        DualNotionUploader 경유로 개인 DB 동시 반영을 가능하게 하기 위한 진입점.
+        """
+        try:
+            self.client.pages.update(
+                page_id=page_id, properties=properties,
+            )
+            return True
+        except Exception as e:
+            logger.warning(f"페이지 속성 업데이트 실패: {e}")
+            return False
+
     def _get_next_property_number_UNUSED(self) -> str:
         """(사용하지 않음 - 매물번호 기능 제거됨)"""
         max_num = 0
@@ -2541,6 +2557,221 @@ class NotionUploader:
         return results
 
 
+class DualNotionUploader:
+    """공유 DB + 개인 DB 이중 기록 래퍼.
+
+    - 모든 mutation (생성/수정/삭제/거래완료/블록추가/속성수정) 호출은
+      공유 DB(primary)와 개인 DB(secondary) 양쪽에 순차 반영합니다.
+    - 쿼리/조회 계열 메서드는 primary 전용 (공유 DB가 진실 원천).
+    - primary_page_id ↔ secondary_page_id 매핑은 page_pair_mapping.json에 보존.
+    - 페어 매핑이 없으면 secondary DB에서 telegram_msg_id로 자동 복구.
+    - secondary 실패는 경고만 남기고 primary 결과를 그대로 반환 (fail-soft).
+    """
+
+    _PAIR_MAP_FILE = "page_pair_mapping.json"
+
+    def __init__(
+        self,
+        primary: "NotionUploader",
+        secondary: Optional["NotionUploader"] = None,
+    ):
+        self.primary = primary
+        self.secondary = secondary
+        self._pair_map: Dict[str, str] = {}
+        if self.secondary:
+            self._load_pair_map()
+
+    # ── 공용 속성 (기존 코드가 .client, .database_id를 직접 참조) ──
+    @property
+    def client(self):
+        return self.primary.client
+
+    @property
+    def database_id(self):
+        return self.primary.database_id
+
+    # ── 페어 매핑 파일 I/O ──
+    def _load_pair_map(self):
+        try:
+            with open(self._PAIR_MAP_FILE, "r", encoding="utf-8") as f:
+                self._pair_map = _json.load(f)
+            logger.info(
+                f"페어 매핑 로드: {len(self._pair_map)}개"
+            )
+        except FileNotFoundError:
+            logger.info("페어 매핑 파일 없음, 빈 상태로 시작")
+        except Exception as e:
+            logger.warning(f"페어 매핑 로드 실패: {e}")
+
+    def _save_pair_map(self):
+        try:
+            with open(self._PAIR_MAP_FILE, "w", encoding="utf-8") as f:
+                _json.dump(
+                    self._pair_map, f, ensure_ascii=False, indent=2,
+                )
+        except Exception as e:
+            logger.warning(f"페어 매핑 저장 실패: {e}")
+
+    def _resolve_secondary_id(
+        self, primary_page_id: str
+    ) -> Optional[str]:
+        """primary_page_id → secondary page_id.
+
+        1) 캐시에서 조회
+        2) 없으면 primary 페이지의 telegram_msg_id를 읽어
+           secondary DB에서 검색하여 복구
+        """
+        if not self.secondary:
+            return None
+        if primary_page_id in self._pair_map:
+            return self._pair_map[primary_page_id]
+        try:
+            props = self.primary.get_page_properties(primary_page_id)
+            msg_id_raw = props.get("telegram_msg_id")
+            if msg_id_raw is None:
+                return None
+            try:
+                msg_id = int(msg_id_raw)
+            except (TypeError, ValueError):
+                return None
+            secondary_id = self.secondary.find_page_by_msg_id(msg_id)
+            if secondary_id:
+                self._pair_map[primary_page_id] = secondary_id
+                self._save_pair_map()
+                logger.info(
+                    f"페어 매핑 복구: {primary_page_id[:8]}… → "
+                    f"{secondary_id[:8]}…"
+                )
+                return secondary_id
+        except Exception as e:
+            logger.debug(f"secondary page_id 조회 실패: {e}")
+        return None
+
+    # ── mutation: 양쪽 DB에 반영 ──
+    def ensure_sync_properties(self):
+        self.primary.ensure_sync_properties()
+        if self.secondary:
+            try:
+                self.secondary.ensure_sync_properties()
+            except Exception as e:
+                logger.warning(
+                    f"개인 DB 동기화 속성 생성 실패: {e}"
+                )
+
+    def upload_property(
+        self,
+        property_data: Dict,
+        photo_urls: Optional[List[str]] = None,
+        floor_photos: Optional[List[Dict]] = None,
+    ) -> Tuple[str, str]:
+        page_url, page_id = self.primary.upload_property(
+            property_data, photo_urls, floor_photos=floor_photos,
+        )
+        if self.secondary:
+            try:
+                _, sid = self.secondary.upload_property(
+                    property_data, photo_urls,
+                    floor_photos=floor_photos,
+                )
+                self._pair_map[page_id] = sid
+                self._save_pair_map()
+                logger.info(
+                    f"개인 DB 저장 완료: {sid[:8]}…"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"개인 DB 저장 실패 (공유 DB만 반영됨): {e}"
+                )
+        return page_url, page_id
+
+    def update_property(
+        self, page_id: str, property_data: Dict
+    ) -> str:
+        result = self.primary.update_property(page_id, property_data)
+        if self.secondary:
+            sid = self._resolve_secondary_id(page_id)
+            if sid:
+                try:
+                    self.secondary.update_property(sid, property_data)
+                except Exception as e:
+                    logger.warning(f"개인 DB 업데이트 실패: {e}")
+            else:
+                logger.debug(
+                    f"개인 DB 페어 없음 → 수정 스킵: "
+                    f"{page_id[:8]}…"
+                )
+        return result
+
+    def archive_property(self, page_id: str) -> bool:
+        result = self.primary.archive_property(page_id)
+        if self.secondary:
+            sid = self._resolve_secondary_id(page_id)
+            if sid:
+                try:
+                    self.secondary.archive_property(sid)
+                    self._pair_map.pop(page_id, None)
+                    self._save_pair_map()
+                except Exception as e:
+                    logger.warning(f"개인 DB 아카이브 실패: {e}")
+        return result
+
+    def update_deal_status(
+        self, page_id: str, agent_name: Optional[str] = None,
+    ) -> bool:
+        result = self.primary.update_deal_status(page_id, agent_name)
+        if self.secondary:
+            sid = self._resolve_secondary_id(page_id)
+            if sid:
+                try:
+                    self.secondary.update_deal_status(sid, agent_name)
+                except Exception as e:
+                    logger.warning(
+                        f"개인 DB 거래완료 업데이트 실패: {e}"
+                    )
+        return result
+
+    def append_blocks_to_page(
+        self, page_id: str, blocks: List[Dict],
+    ) -> bool:
+        result = self.primary.append_blocks_to_page(page_id, blocks)
+        if self.secondary:
+            sid = self._resolve_secondary_id(page_id)
+            if sid:
+                try:
+                    self.secondary.append_blocks_to_page(sid, blocks)
+                except Exception as e:
+                    logger.warning(f"개인 DB 블록 추가 실패: {e}")
+        return result
+
+    def update_page_raw_properties(
+        self, page_id: str, properties: Dict,
+    ) -> bool:
+        result = self.primary.update_page_raw_properties(
+            page_id, properties,
+        )
+        if self.secondary:
+            sid = self._resolve_secondary_id(page_id)
+            if sid:
+                try:
+                    self.secondary.update_page_raw_properties(
+                        sid, properties,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"개인 DB 속성 업데이트 실패: {e}"
+                    )
+        return result
+
+    # ── 쿼리 계열: primary에 위임 (공유 DB가 진실 원천) ──
+    def __getattr__(self, name):
+        # primary로 위임. self.primary가 아직 세팅되지 않았다면
+        # 재귀를 피하기 위해 AttributeError 전파.
+        primary = self.__dict__.get("primary")
+        if primary is None:
+            raise AttributeError(name)
+        return getattr(primary, name)
+
+
 class TelegramNotionBot:
     """텔레그램-노션 연동 봇 (앨범/여러 장 사진 + 원본 수정 자동 반영)"""
 
@@ -2612,9 +2843,24 @@ class TelegramNotionBot:
         telegram_token: str,
         notion_token: str,
         database_id: str,
+        private_database_id: Optional[str] = None,
     ):
         self.telegram_token = telegram_token
-        self.notion_uploader = NotionUploader(notion_token, database_id)
+        primary_uploader = NotionUploader(notion_token, database_id)
+        if private_database_id:
+            secondary_uploader = NotionUploader(
+                notion_token, private_database_id,
+            )
+            self.notion_uploader = DualNotionUploader(
+                primary_uploader, secondary_uploader,
+            )
+            logger.info(
+                f"개인 DB 이중 기록 활성화: "
+                f"{private_database_id[:8]}…"
+            )
+        else:
+            self.notion_uploader = primary_uploader
+            logger.info("단일 DB 모드 (개인 DB 미설정)")
         self.parser = PropertyParser()
         # 미디어 그룹 버퍼
         self._media_groups: Dict[str, Dict] = {}
@@ -4902,7 +5148,7 @@ class TelegramNotionBot:
                         skipped += 1
                         continue
 
-                    # 4. 노션 상가 특징 업데이트
+                    # 4. 노션 상가 특징 업데이트 (개인 DB에도 동시 반영)
                     update_props = {
                         "상가 특징": {
                             "multi_select": [
@@ -4911,9 +5157,8 @@ class TelegramNotionBot:
                             ]
                         }
                     }
-                    self.notion_uploader.client.pages.update(
-                        page_id=page_id,
-                        properties=update_props,
+                    self.notion_uploader.update_page_raw_properties(
+                        page_id, update_props,
                     )
                     recovered += 1
                     logger.info(
@@ -5589,6 +5834,8 @@ if __name__ == "__main__":
     TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
     NOTION_TOKEN = os.getenv("NOTION_TOKEN")
     DATABASE_ID = os.getenv("NOTION_DATABASE_ID")
+    # 선택: 개인용(관리자 전용) 노션 DB ID. 설정 시 공유 DB와 동시 기록.
+    PRIVATE_DATABASE_ID = os.getenv("PRIVATE_NOTION_DATABASE_ID") or None
 
     if not all([TELEGRAM_TOKEN, NOTION_TOKEN, DATABASE_ID]):
         print("=" * 50)
@@ -5606,6 +5853,7 @@ if __name__ == "__main__":
         exit(1)
 
     bot = TelegramNotionBot(
-        TELEGRAM_TOKEN, NOTION_TOKEN, DATABASE_ID
+        TELEGRAM_TOKEN, NOTION_TOKEN, DATABASE_ID,
+        private_database_id=PRIVATE_DATABASE_ID,
     )
     bot.run()
