@@ -2966,19 +2966,27 @@ class TelegramNotionBot:
     # ──────────────────────────────────────────────
 
     @staticmethod
+    def _is_contact_line(line: str) -> bool:
+        """연락처 줄 여부 판별 (전화번호 패턴 포함 시 True)"""
+        return bool(re.search(r'\d{2,3}[-\s]?\d{3,4}[-\s]?\d{4}', line))
+
+    @staticmethod
     def _reorder_section9(description: str) -> str:
-        """9번 항목을 8번 바로 아래로 이동 (사이에 특이사항이 껴 있어도)
+        """9번 항목을 8번(+연락처) 바로 아래로 이동
+
+        연락처 줄(전화번호 포함)은 8번과 함께 유지하고,
+        특이사항(메모성 텍스트)만 9번 아래로 이동한다.
 
         Before:
             8. 양도인 010-...
-            임차인 연락안됨
+            임대인 01038068538
             건물주 착한사람입니다.
             9. 채광, 적벽
 
         After:
             8. 양도인 010-...
+            임대인 01038068538
             9. 채광, 적벽
-            임차인 연락안됨
             건물주 착한사람입니다.
         """
         lines = description.split('\n')
@@ -2998,15 +3006,19 @@ class TelegramNotionBot:
         if line9_idx <= line8_idx + 1:
             return description
 
-        # 8번과 9번 사이 줄(특이사항)과 9번 줄을 분리
+        # 8번과 9번 사이 줄을 연락처 / 특이사항으로 분류
         line9_content = lines[line9_idx]
-        between = lines[line8_idx + 1: line9_idx]   # 특이사항
-        rest    = lines[line9_idx + 1:]               # 9번 이후
+        between = lines[line8_idx + 1: line9_idx]
+        rest    = lines[line9_idx + 1:]
+
+        contacts = [l for l in between if PropertyParser._is_contact_line(l)]
+        notes    = [l for l in between if not PropertyParser._is_contact_line(l)]
 
         new_lines = (
             lines[:line8_idx + 1]   # 1~8번
-            + [line9_content]        # 9번 (8번 바로 아래)
-            + between                # 특이사항 (9번 아래로)
+            + contacts               # 추가 연락처 (8번과 함께 유지)
+            + [line9_content]        # 9번
+            + notes                  # 특이사항 (9번 아래로)
             + rest
         )
         return '\n'.join(new_lines)
