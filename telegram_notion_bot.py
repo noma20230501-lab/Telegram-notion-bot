@@ -3011,8 +3011,8 @@ class TelegramNotionBot:
         between = lines[line8_idx + 1: line9_idx]
         rest    = lines[line9_idx + 1:]
 
-        contacts = [l for l in between if PropertyParser._is_contact_line(l)]
-        notes    = [l for l in between if not PropertyParser._is_contact_line(l)]
+        contacts = [l for l in between if TelegramNotionBot._is_contact_line(l)]
+        notes    = [l for l in between if not TelegramNotionBot._is_contact_line(l)]
 
         new_lines = (
             lines[:line8_idx + 1]   # 1~8번
