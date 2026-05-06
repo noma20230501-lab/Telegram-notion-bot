@@ -2235,6 +2235,75 @@ class NotionUploader:
             )
             return None
 
+    def update_original_message_block(
+        self, page_id: str, new_text: str
+    ) -> bool:
+        """노션 페이지의 '원본 메시지' 블록 텍스트를 갱신"""
+        try:
+            has_more = True
+            start_cursor = None
+            found_heading = False
+
+            while has_more:
+                params = {
+                    "block_id": page_id,
+                    "page_size": 100,
+                }
+                if start_cursor:
+                    params["start_cursor"] = start_cursor
+
+                response = self.client.blocks.children.list(
+                    **params
+                )
+
+                for block in response.get("results", []):
+                    btype = block.get("type", "")
+
+                    if btype == "heading_3":
+                        rt = block["heading_3"].get(
+                            "rich_text", []
+                        )
+                        if rt:
+                            text = rt[0].get(
+                                "text", {}
+                            ).get("content", "")
+                            if "원본 메시지" in text:
+                                found_heading = True
+                                continue
+
+                    if found_heading and btype == "paragraph":
+                        self.client.blocks.update(
+                            block_id=block["id"],
+                            paragraph={
+                                "rich_text": [
+                                    {
+                                        "text": {
+                                            "content": new_text[:2000]
+                                        }
+                                    }
+                                ]
+                            },
+                        )
+                        logger.info(
+                            f"원본 메시지 블록 갱신 완료: "
+                            f"page_id={page_id}"
+                        )
+                        return True
+
+                has_more = response.get("has_more", False)
+                start_cursor = response.get("next_cursor")
+
+            logger.warning(
+                f"원본 메시지 블록을 찾지 못함: page_id={page_id}"
+            )
+            return False
+        except Exception as e:
+            logger.error(
+                f"원본 메시지 블록 업데이트 실패 "
+                f"(page_id={page_id}): {e}"
+            )
+            return False
+
     def find_page_by_msg_id(self, msg_id: int) -> Optional[str]:
         """telegram_msg_id로 노션 페이지 ID 조회 (봇 재시작 후 복구용)"""
         try:
@@ -3782,7 +3851,7 @@ class TelegramNotionBot:
         context,
         agent_name: Optional[str],
     ):
-        """거래완료 답장 처리 → 노션 '거래 상태' 업데이트
+        """거래완료 답장 처리 → 노션 '거래 상태' 업데이트 + 원본 메시지에 표시
 
         Args:
             message: 답장 메시지 객체
@@ -3812,6 +3881,11 @@ class TelegramNotionBot:
                 await message.reply_text(result_msg)
             except Exception:
                 pass
+
+            # 원본 매물 메시지 주소 뒤에 (계약완료) 표시
+            await self._mark_deal_complete_on_message(
+                reply, context, agent_name
+            )
         else:
             try:
                 await message.reply_text(
@@ -3819,6 +3893,98 @@ class TelegramNotionBot:
                 )
             except Exception:
                 pass
+
+    async def _mark_deal_complete_on_message(
+        self, reply_msg, context, agent_name: Optional[str]
+    ):
+        """원본 매물 메시지의 첫 줄(주소) 뒤에 (계약완료) 또는 (계약완료 이름) 추가"""
+        original_text = reply_msg.text or reply_msg.caption or ""
+        if not original_text:
+            return
+
+        suffix = "(계약완료)"
+        if agent_name:
+            suffix = f"(계약완료 {agent_name})"
+
+        lines = original_text.split("\n")
+        first_line = lines[0]
+
+        # 이미 (계약완료)가 포함되어 있으면 중복 방지
+        if "계약완료" in first_line.replace(" ", ""):
+            return
+
+        lines[0] = f"{first_line} {suffix}"
+        new_text = "\n".join(lines)
+
+        is_caption = reply_msg.caption is not None
+
+        # HTML 하이퍼링크가 있는 경우 대비: HTML 모드 시도 → plain fallback
+        escaped_new_text = html.escape(new_text)
+        # 구분선 아래 노션 링크 복원 (HTML entity로 인코딩된 URL 복원)
+        # 기존 entities에서 URL 추출하여 HTML 링크 복원
+        notion_url = None
+        entities = reply_msg.entities or reply_msg.caption_entities or []
+        for ent in entities:
+            if ent.type == "text_link" and "notion.so" in (ent.url or ""):
+                notion_url = ent.url
+                break
+
+        if notion_url and self.DIVIDER in escaped_new_text:
+            parts = escaped_new_text.split(html.escape(self.DIVIDER), 1)
+            below = parts[1] if len(parts) > 1 else ""
+            # "✅ Notion" 텍스트를 HTML 하이퍼링크로 변환
+            below = below.replace(
+                "✅ Notion",
+                f'✅ <a href="{notion_url}">Notion</a>',
+            )
+            escaped_new_text = parts[0] + html.escape(self.DIVIDER) + below
+
+        try:
+            if is_caption:
+                await context.bot.edit_message_caption(
+                    chat_id=reply_msg.chat_id,
+                    message_id=reply_msg.message_id,
+                    caption=escaped_new_text,
+                    parse_mode="HTML",
+                )
+            else:
+                await context.bot.edit_message_text(
+                    chat_id=reply_msg.chat_id,
+                    message_id=reply_msg.message_id,
+                    text=escaped_new_text,
+                    parse_mode="HTML",
+                )
+            logger.info(
+                f"계약완료 표시 성공 (HTML): msg_id={reply_msg.message_id}, "
+                f"suffix={suffix}"
+            )
+        except Exception as e:
+            logger.warning(
+                f"계약완료 HTML 모드 실패, plain text 재시도: {e}"
+            )
+            # Fallback: plain text
+            try:
+                if is_caption:
+                    await context.bot.edit_message_caption(
+                        chat_id=reply_msg.chat_id,
+                        message_id=reply_msg.message_id,
+                        caption=new_text,
+                    )
+                else:
+                    await context.bot.edit_message_text(
+                        chat_id=reply_msg.chat_id,
+                        message_id=reply_msg.message_id,
+                        text=new_text,
+                    )
+                logger.info(
+                    f"계약완료 표시 성공 (plain): msg_id={reply_msg.message_id}, "
+                    f"suffix={suffix}"
+                )
+            except Exception as e2:
+                logger.error(
+                    f"계약완료 메시지 수정 실패: {e2} "
+                    f"(chat={reply_msg.chat_id}, msg={reply_msg.message_id})"
+                )
 
     # ──────────────────────────────────────────────
     # 매핑 파일 저장/로드 (재시작 후에도 page_mapping 유지)
@@ -4068,6 +4234,12 @@ class TelegramNotionBot:
             page_url = self.notion_uploader.update_property(
                 page_id, new_property_data
             )
+            
+            # 노션 '원본 메시지' 블록도 갱신
+            if property_text != old_property_text:
+                self.notion_uploader.update_original_message_block(
+                    page_id, property_text
+                )
             
             # 변경 요약 생성
             summary = self._build_update_summary(old_data, new_property_data)
